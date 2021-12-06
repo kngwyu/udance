@@ -12,7 +12,7 @@ import numpy as np
 import optax
 import rlax
 
-from brax.envs import Env, State as BraxState
+from brax.envs import Env, State as BraxState, create as create_brax_env
 
 chex.Array = chex.Array
 Array = t.Union[chex.Array, np.ndarray]
@@ -226,11 +226,8 @@ class Actor:
         net_init_key: PRNGKey,
         initial_state: chex.Array,
     ) -> None:
-        self._pi_and_v = lambda obs: MLPPolicy(env.action_size, config)(obs)
-
         def step_impl(
             state: BraxState,
-            prng_key: chex.PRNGKey,
         ) -> t.Tuple[BraxState, chex.Array, GaussianAndValue]:
             output = MLPPolicy(action_dim=env.action_size, config=Config)(state.obs)
             policy = distrax.MultivariateNormalDiag(output.mu, output.stddev)
@@ -241,19 +238,6 @@ class Actor:
         init, step_transformed = hk.transform(step_impl)
         self.params = init(net_init_key, initial_state)
         self._step_impl = jax.jit(step_transformed)
-
-    @functools.partial(jax.jit, static_argnums=0)
-    def _step(
-        self,
-        params: hk.Params,
-        state: BraxState,
-        prng_key: chex.PRNGKey,
-    ) -> t.Tuple[BraxState, chex.Array, GaussianAndValue]:
-        output = self._pi_and_v(params, state.obs)
-        policy = distrax.MultivariateNormalDiag(output.mu, output.stddev)
-        action = policy.sample(seed=prng_key)
-        state = env.step(state, action)
-        return state, action, output
 
     def step(
         self,
@@ -276,6 +260,7 @@ class Learner:
         self._actor = actor
         self._opt_state = optimizer.init(actor.params)
         self._opt_update = optimizer.update
+        fwd = lambda obs: MLPPolicy(action_dim=action_dim, config=config)(obs)  # noqa
         _, self._pi_and_v = hk.without_apply_rng(hk.transform(fwd))
 
     @functools.partial(jax.jit, static_argnums=0)
@@ -339,9 +324,7 @@ class Learner:
 
 
 def test_ppo() -> None:
-    from brax import envs
-
-    env = envs.create(
+    env = create_brax_env(
         env_name="ant",
         episode_length=1000,
         action_repeat=1,
@@ -364,7 +347,7 @@ def test_ppo() -> None:
         optimizer=optax.adam(3e-4, eps=1e-4),
     )
     rollout = RolloutResult([state.obs])
-    for _ in range(100):
+    for _ in range(1000):
         for _ in range(256):
             state, act, out = actor.step(state, next(prng_seq))
             rollout.append(
@@ -376,6 +359,7 @@ def test_ppo() -> None:
             )
         batch = learner.learn(rollout, prng_seq)
         print(batch.reward.mean())
+        rollout.clear()
 
 
 if __name__ == "__main__":
