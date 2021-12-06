@@ -12,6 +12,8 @@ import numpy as np
 import optax
 import rlax
 
+from brax.envs import Env, State as BraxState
+
 chex.Array = chex.Array
 Array = t.Union[chex.Array, np.ndarray]
 
@@ -219,48 +221,56 @@ class Actor:
     def __init__(
         self,
         *,
-        action_dim: int,
+        env: Env,
         config: Config,
         net_init_key: PRNGKey,
         initial_obs: chex.Array,
     ) -> None:
-        def act_impl(observation: Array) -> t.Tuple[chex.Array, GaussianAndValue]:
-            chex.assert_rank(observation, 2)
-            output = MLPPolicy(action_dim=action_dim, config=Config)(observation)
-            policy = distrax.MultivariateNormalDiag(output.mu, output.stddev)
-            return policy.sample(seed=hk.next_rng_key()), output
-
-        init, act_transformed = hk.transform(act_impl)
+        net = lambda obs: MLPPolicy(env.action_size, config)(obs)  # noqa
+        init, self._pi_and_v = hk.without_apply_rng(hk.transform(net))
+        self.env = env
         self.params = init(net_init_key, initial_obs)
-        self._act_impl = jax.jit(act_transformed)
 
-    def act(
+    @functools.partial(jax.jit, static_argnums=0)
+    def _step(
         self,
-        obs: Observation,
+        params: hk.Params,
+        state: BraxState,
         prng_key: chex.PRNGKey,
-    ) -> t.Tuple[chex.Array, GaussianAndValue]:
-        return self._act_impl(self.params, prng_key, obs)
+    ) -> t.Tuple[BraxState, chex.Array, GaussianAndValue]:
+        output = self._pi_and_v(params, state.obs)
+        policy = distrax.MultivariateNormalDiag(output.mu, output.stddev)
+        action = policy.sample(seed=prng_key)
+        state = self.env.step(state, action)
+        return state, action, output
+
+    def step(
+        self,
+        state: BraxState,
+        prng_key: chex.PRNGKey,
+    ) -> t.Tuple[BraxState, chex.Array, GaussianAndValue]:
+        return self._step(self.params, state, prng_key)
 
 
 class Learner:
     def __init__(
         self,
         *,
+        actor: Actor,
         action_dim: int,
         config: Config,
-        actor: Actor,
         optimizer: optax.GradientTransformation,
     ) -> None:
         self._config = config
         self._actor = actor
         self._opt_state = optimizer.init(actor.params)
         self._opt_update = optimizer.update
-        fwd = lambda obs: MLPPolicy(action_dim=action_dim, config=config)(obs)  # noqa
-        _, self._pi_and_v = hk.without_apply_rng(hk.transform(fwd))
 
     @functools.partial(jax.jit, static_argnums=0)
     def _next_value(self, params: hk.Params, last_obs: Array) -> chex.Array:
-        _, _, next_value = jax.lax.stop_gradient(self._pi_and_v(params, last_obs))
+        _, _, next_value = jax.lax.stop_gradient(
+            self._actor._pi_and_v(params, last_obs)
+        )
         return next_value
 
     def learn(
@@ -297,7 +307,7 @@ class Learner:
         return optax.apply_updates(params, updates), new_opt_state
 
     def _loss(self, params: hk.Params, batch: Batch) -> chex.Array:
-        mu, stddev, value = self._pi_and_v(params, batch.observation)
+        mu, stddev, value = self._actor._pi_and_v(params, batch.observation)
 
         # Policy loss
         policy = distrax.Normal(mu, stddev)
@@ -332,7 +342,7 @@ def test_ppo() -> None:
     state = env.reset(rng=next(prng_seq))
     config = Config()
     actor = Actor(
-        action_dim=env.action_size,
+        env=env,
         config=config,
         net_init_key=next(prng_seq),
         initial_obs=state.obs,
@@ -341,13 +351,12 @@ def test_ppo() -> None:
         action_dim=env.action_size,
         config=config,
         actor=actor,
-        optimizer=optax.adam(1e-3),
+        optimizer=optax.adam(3e-4, eps=1e-4),
     )
     rollout = RolloutResult([state.obs])
     for _ in range(100):
         for _ in range(256):
-            act, out = actor.act(state.obs, next(prng_seq))
-            state = env.step(state, act)
+            state, act, out = actor.step(state, next(prng_seq))
             rollout.append(
                 observation=state.obs,
                 action=act,
