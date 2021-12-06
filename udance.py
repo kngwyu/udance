@@ -317,15 +317,14 @@ class Learner:
         return policy_loss + value_loss - self._config.entropy_coef * entropy_mean
 
 
-@chex.dataclass
-class WavData:
+class WavData(t.NamedTuple):
     mel: chex.Array
     wav: chex.Array
     sample_rate: int
 
 
 def wav2mel(
-    y: np.Array,
+    wav: np.Array,
     sample_rate: int,
     n_fft: int = 1024,
     hop_length: int = 256,
@@ -335,7 +334,7 @@ def wav2mel(
     fmax: int = 8000,
 ) -> np.Array:
     mel = librosa.feature.melspectrogram(
-        y,
+        librosa.to_mono(wav),
         sr=sample_rate,
         n_fft=n_fft,
         hop_length=hop_length,
@@ -357,40 +356,50 @@ def load_data_on_memory(
     # load all data files on memory
     dataset = []
     for fp in tqdm(sorted(wav_dir.glob("*.wav"))):
-        y, sr = sf.read(fp, dtype="int16")
-        mel = wav2mel(y.astype(np.float32) / 2 ** 15, sample_rate=sr)
-        dataset.append(WavDataset(mel=jnp.array(mel), wav=jnp.array(y), sample_rate=sr))
+        wav, sr = sf.read(fp, dtype="int16")
+        mel = wav2mel(wav.astype(np.float32) / 2 ** 15, sample_rate=sr)
+        dataset.append(WavData(mel=jnp.array(mel), wav=jnp.array(wav), sample_rate=sr))
     return dataset
 
 
 def create_data_iter(
     dataset: t.List[WavData],
+    prng_seq: hk.PRNGSequence,
     seq_len: int,
     batch_size: int,
     hop_length: int = 256,
 ) -> t.Iterable[t.Tuple[np.Array, np.Array]]:
+
     batch = []
-
     while True:
-        random.shuffle(dataset)
-        for mel, y in dataset:
-            R = random.randint(seq_len, mel.shape[1] - 1)
-            L = R - seq_len
-            m1 = mel[:, L:R]
-            y1 = y[(L * FLAGS.hop_length) : (R * FLAGS.hop_length)]
-            batch.append((m1, y1))
+        indices = jax.random.permutation(next(prng_seq), len(dataset))
+        for mel, wav, _sr in map(lambda idx: dataset[idx], indices):
+            r_idx = jax.random.randint(
+                next(prng_seq),
+                shape=(),
+                minval=seq_len,
+                maxval=mel.shape[1] - 1,
+            )
+            l_idx = seq_len - r_idx
+            batch.append(
+                (mel[:, l_idx:r_idx], wav[l_idx * hop_length : r_idx * hop_length])
+            )
             if len(batch) == batch_size:
-                m2, y2 = zip(*batch)
-                m2 = np.stack(m2, axis=0)
-                m2 = np.swapaxes(m2, 1, 2)
-                y2 = np.stack(y2, axis=0)
+                mel_batch, wav_batch = jax.tree_map(
+                    lambda *array: jnp.stack(array),
+                    *batch,
+                )
+                yield jnp.swapaxes(mel_batch, 1, 2), wav_batch
+                batch.clear()
 
-                yield m2, y2
-                batch = []
 
-
-def test_audio_processing() -> None:
-    pass
+def test_audio_processing(wave_dir: str) -> None:
+    data = load_data_on_memory(pathlib.Path(wave_dir))
+    prng_seq = hk.PRNGSequence(0)
+    data_iter = create_data_iter(data, prng_seq, 100, 64)
+    for i in range(5):
+        mel, wav = next(data_iter)
+        print(mel.shape, wav.shape)
 
 
 def test_ppo() -> None:
@@ -456,5 +465,6 @@ if __name__ == "__main__":
     import typer
 
     app = typer.Typer()
+    app.command()(test_audio_processing)
     app.command()(test_ppo)
     app()
