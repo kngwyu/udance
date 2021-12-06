@@ -1,3 +1,6 @@
+"""Based on https://github.com/NTT123/wavernn-16bit
+"""
+
 import dataclasses
 import functools
 import pathlib
@@ -8,34 +11,21 @@ import distrax
 import haiku as hk
 import jax
 import jax.numpy as jnp
+import librosa
 import numpy as np
 import optax
 import rlax
+import soundfile as sf
 
 from brax.envs import Env, State as BraxState, create as create_brax_env
+from brax.io import html as brax_html
+from tqdm.auto import tqdm
 
-chex.Array = chex.Array
-Array = t.Union[chex.Array, np.ndarray]
+np.Array = chex.Array
+Array = t.Union[chex.Array, np.Array]
 
-Observation = np.ndarray
-MaybePath = t.Union[pathlib.Path, str]
 NetworkOutput = t.Any
-PRNGKey = jnp.ndarray
-Actor = t.Callable[[Observation], t.Tuple[chex.Array, NetworkOutput]]
-ActionWrapper = t.Callable[[Array], Array]
 Self = t.Any
-
-
-def chain(*functions) -> t.Callable[..., t.Any]:
-    """Chain multiple functions"""
-
-    def chained_fn(*args, **kwargs) -> t.Any:
-        x = functions[0](*args, **kwargs)
-        for fn in functions[1:]:
-            x = fn(x)
-        return x
-
-    return chained_fn
 
 
 @dataclasses.dataclass(frozen=True)
@@ -135,7 +125,7 @@ class RolloutResult:
     Required experiences for PPO.
     """
 
-    observations: t.List[Observation]
+    observations: t.List[chex.Array]
     actions: t.List[chex.Array] = dataclasses.field(default_factory=list)
     rewards: t.List[chex.Array] = dataclasses.field(default_factory=list)
     terminals: t.List[chex.Array] = dataclasses.field(default_factory=list)
@@ -144,7 +134,7 @@ class RolloutResult:
     def append(
         self,
         *,
-        observation: Observation,
+        observation: chex.Array,
         action: chex.Array,
         reward: chex.Array,
         output: GaussianAndValue,
@@ -156,7 +146,7 @@ class RolloutResult:
         self.outputs.append(output)
         self.terminals.append(terminal)
 
-    def last_obs(self) -> Observation:
+    def last_obs(self) -> chex.Array:
         assert len(self.observations) == len(self.actions) + 1
         return self.observations[-1]
 
@@ -223,26 +213,30 @@ class Actor:
         *,
         env: Env,
         config: Config,
-        net_init_key: PRNGKey,
+        net_init_key: chex.PRNGKey,
         initial_state: chex.Array,
     ) -> None:
+        init, step_transformed = self.make_step_fn(env)
+        self.params = init(net_init_key, initial_state)
+        self._step_impl = jax.jit(step_transformed)
+
+    @staticmethod
+    def make_step_fn(env: Env) -> hk.Transformed:
         def step_impl(
             state: BraxState,
         ) -> t.Tuple[BraxState, chex.Array, GaussianAndValue]:
             output = MLPPolicy(action_dim=env.action_size, config=Config)(state.obs)
             policy = distrax.MultivariateNormalDiag(output.mu, output.stddev)
             action = policy.sample(seed=hk.next_rng_key())
-            state = env.step(state, action)
+            state = env.step(state, jnp.tanh(action))
             return state, action, output
 
-        init, step_transformed = hk.transform(step_impl)
-        self.params = init(net_init_key, initial_state)
-        self._step_impl = jax.jit(step_transformed)
+        return hk.transform(step_impl)
 
     def step(
         self,
-        state: BraxState,
         prng_key: chex.PRNGKey,
+        state: BraxState,
     ) -> t.Tuple[chex.Array, GaussianAndValue]:
         return self._step_impl(self.params, prng_key, state)
 
@@ -323,6 +317,82 @@ class Learner:
         return policy_loss + value_loss - self._config.entropy_coef * entropy_mean
 
 
+@chex.dataclass
+class WavData:
+    mel: chex.Array
+    wav: chex.Array
+    sample_rate: int
+
+
+def wav2mel(
+    y: np.Array,
+    sample_rate: int,
+    n_fft: int = 1024,
+    hop_length: int = 256,
+    win_length: int = 1024,
+    n_mels: int = 80,
+    fmin: int = 0,
+    fmax: int = 8000,
+) -> np.Array:
+    mel = librosa.feature.melspectrogram(
+        y,
+        sr=sample_rate,
+        n_fft=n_fft,
+        hop_length=hop_length,
+        win_length=win_length,
+        window="hann",
+        center=True,
+        n_mels=n_mels,
+        fmin=fmin,
+        fmax=fmax,
+        power=1,
+    )
+    mel = np.log(mel + 1e-5)
+    return mel
+
+
+def load_data_on_memory(
+    wav_dir: pathlib.Path,
+) -> t.List[WavData]:
+    # load all data files on memory
+    dataset = []
+    for fp in tqdm(sorted(wav_dir.glob("*.wav"))):
+        y, sr = sf.read(fp, dtype="int16")
+        mel = wav2mel(y.astype(np.float32) / 2 ** 15, sample_rate=sr)
+        dataset.append(WavDataset(mel=jnp.array(mel), wav=jnp.array(y), sample_rate=sr))
+    return dataset
+
+
+def create_data_iter(
+    dataset: t.List[WavData],
+    seq_len: int,
+    batch_size: int,
+    hop_length: int = 256,
+) -> t.Iterable[t.Tuple[np.Array, np.Array]]:
+    batch = []
+
+    while True:
+        random.shuffle(dataset)
+        for mel, y in dataset:
+            R = random.randint(seq_len, mel.shape[1] - 1)
+            L = R - seq_len
+            m1 = mel[:, L:R]
+            y1 = y[(L * FLAGS.hop_length) : (R * FLAGS.hop_length)]
+            batch.append((m1, y1))
+            if len(batch) == batch_size:
+                m2, y2 = zip(*batch)
+                m2 = np.stack(m2, axis=0)
+                m2 = np.swapaxes(m2, 1, 2)
+                y2 = np.stack(y2, axis=0)
+
+                yield m2, y2
+                batch = []
+
+
+def test_audio_processing() -> None:
+    pass
+
+
 def test_ppo() -> None:
     env = create_brax_env(
         env_name="ant",
@@ -330,6 +400,13 @@ def test_ppo() -> None:
         action_repeat=1,
         auto_reset=True,
         batch_size=16,
+    )
+    eval_env = create_brax_env(
+        env_name="ant",
+        episode_length=1000,
+        action_repeat=1,
+        auto_reset=True,
+        batch_size=1,
     )
     prng_seq = hk.PRNGSequence(0)
     state = env.reset(rng=next(prng_seq))
@@ -340,6 +417,7 @@ def test_ppo() -> None:
         net_init_key=next(prng_seq),
         initial_state=state,
     )
+    eval_step = jax.jit(actor.make_step_fn(eval_env)[1])
     learner = Learner(
         action_dim=env.action_size,
         config=config,
@@ -347,9 +425,9 @@ def test_ppo() -> None:
         optimizer=optax.adam(3e-4, eps=1e-4),
     )
     rollout = RolloutResult([state.obs])
-    for _ in range(1000):
+    for i in range(1000):
         for _ in range(256):
-            state, act, out = actor.step(state, next(prng_seq))
+            state, act, out = actor.step(next(prng_seq), state)
             rollout.append(
                 observation=state.obs,
                 action=act,
@@ -358,7 +436,19 @@ def test_ppo() -> None:
                 terminal=state.done,
             )
         batch = learner.learn(rollout, prng_seq)
-        print(batch.reward.mean())
+        print(f"Step {i} Avg. Reward: {jnp.mean(batch.reward)}")
+        if i % 100 == 0:
+            eval_state = eval_env.reset(next(prng_seq))
+            qps = [jax.tree_map(lambda x: x.reshape(x.shape[1:]), eval_state.qp)]
+            while eval_state.done[0] is False:
+                eval_state, _, _ = eval_step(actor.params, next(prng_seq), eval_state)
+                qps.append(
+                    jax.tree_map(lambda x: x.reshape(x.shape[1:]), eval_state.qp)
+                )
+                with open("viewer.html", "w") as f:
+                    f.write(brax_html.render(env.sys, qps))
+            if i // 100 == 1:
+                print("Open viewer.html for checking evaluated behavior!")
         rollout.clear()
 
 
