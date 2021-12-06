@@ -224,12 +224,23 @@ class Actor:
         env: Env,
         config: Config,
         net_init_key: PRNGKey,
-        initial_obs: chex.Array,
+        initial_state: chex.Array,
     ) -> None:
-        net = lambda obs: MLPPolicy(env.action_size, config)(obs)  # noqa
-        init, self._pi_and_v = hk.without_apply_rng(hk.transform(net))
-        self.env = env
-        self.params = init(net_init_key, initial_obs)
+        self._pi_and_v = lambda obs: MLPPolicy(env.action_size, config)(obs)
+
+        def step_impl(
+            state: BraxState,
+            prng_key: chex.PRNGKey,
+        ) -> t.Tuple[BraxState, chex.Array, GaussianAndValue]:
+            output = MLPPolicy(action_dim=env.action_size, config=Config)(state.obs)
+            policy = distrax.MultivariateNormalDiag(output.mu, output.stddev)
+            action = policy.sample(seed=hk.next_rng_key())
+            state = env.step(state, action)
+            return state, action, output
+
+        init, step_transformed = hk.transform(step_impl)
+        self.params = init(net_init_key, initial_state)
+        self._step_impl = jax.jit(step_transformed)
 
     @functools.partial(jax.jit, static_argnums=0)
     def _step(
@@ -241,36 +252,35 @@ class Actor:
         output = self._pi_and_v(params, state.obs)
         policy = distrax.MultivariateNormalDiag(output.mu, output.stddev)
         action = policy.sample(seed=prng_key)
-        state = self.env.step(state, action)
+        state = env.step(state, action)
         return state, action, output
 
     def step(
         self,
         state: BraxState,
         prng_key: chex.PRNGKey,
-    ) -> t.Tuple[BraxState, chex.Array, GaussianAndValue]:
-        return self._step(self.params, state, prng_key)
+    ) -> t.Tuple[chex.Array, GaussianAndValue]:
+        return self._step_impl(self.params, prng_key, state)
 
 
 class Learner:
     def __init__(
         self,
         *,
-        actor: Actor,
         action_dim: int,
         config: Config,
+        actor: Actor,
         optimizer: optax.GradientTransformation,
     ) -> None:
         self._config = config
         self._actor = actor
         self._opt_state = optimizer.init(actor.params)
         self._opt_update = optimizer.update
+        _, self._pi_and_v = hk.without_apply_rng(hk.transform(fwd))
 
     @functools.partial(jax.jit, static_argnums=0)
     def _next_value(self, params: hk.Params, last_obs: Array) -> chex.Array:
-        _, _, next_value = jax.lax.stop_gradient(
-            self._actor._pi_and_v(params, last_obs)
-        )
+        _, _, next_value = jax.lax.stop_gradient(self._pi_and_v(params, last_obs))
         return next_value
 
     def learn(
@@ -307,7 +317,7 @@ class Learner:
         return optax.apply_updates(params, updates), new_opt_state
 
     def _loss(self, params: hk.Params, batch: Batch) -> chex.Array:
-        mu, stddev, value = self._actor._pi_and_v(params, batch.observation)
+        mu, stddev, value = self._pi_and_v(params, batch.observation)
 
         # Policy loss
         policy = distrax.Normal(mu, stddev)
@@ -345,7 +355,7 @@ def test_ppo() -> None:
         env=env,
         config=config,
         net_init_key=next(prng_seq),
-        initial_obs=state.obs,
+        initial_state=state,
     )
     learner = Learner(
         action_dim=env.action_size,
