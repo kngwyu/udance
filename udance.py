@@ -35,18 +35,14 @@ class Config:
     gae_lambda: float = 0.95
     n_optim_epochs: int = 10
     n_minibatches: int = 1
-    normalize_adv: bool = False
     reward_scaling: float = 1.0
     # Network config
     hidden_dims: t.Sequence[int] = (64, 64)
     rnn_hidden_dim: int = 64
     drop_prob: float = 0.5
-
-
-class GaussianAndValue(t.NamedTuple):
-    mu: chex.Array
-    stddev: chex.Array
-    value: chex.Array
+    # Unsupervised learning
+    min_r: float = -1.0
+    max_r: float = 1.0
 
 
 def orthogonal(scale: float = 5.0 / 3.0) -> hk.initializers.Orthogonal:
@@ -68,27 +64,6 @@ def mlp(
         hk.Linear(last_dim, w_init=orthogonal(scale=last_scale)),
     ]
     return hk.Sequential(layers)
-
-
-class MLPPolicy(hk.Module):
-    """MLP Gaussian policy with tunable stddev"""
-
-    def __init__(self, action_dim: int, config: Config) -> None:
-        super().__init__(name="diag_gaussian_pi_and_v")
-
-        self._mu_net = mlp(config.hidden_dims, action_dim, 0.01)
-        self._value_net = mlp(config.hidden_dims, 1, 1.0)
-        self._logstd_param = hk.get_parameter(
-            "logstd",
-            (1, action_dim),
-            init=lambda shape, dtype: jnp.zeros(shape, dtype),
-        )
-
-    def __call__(self, observation: Array) -> GaussianAndValue:
-        mu = self._mu_net(observation)
-        stddev = jnp.ones_like(mu) * jnp.exp(self._logstd_param)
-        value = self._value_net(observation)
-        return GaussianAndValue(mu, stddev, value)
 
 
 class Normal(t.NamedTuple):
@@ -262,18 +237,16 @@ def _gae_impl(
 batched_gae = jax.vmap(_gae_impl, in_axes=(1, 1, None, 1), out_axes=1)
 
 
-@dataclasses.dataclass
+@chex.dataclass
 class RolloutWithMusic:
     observations: t.List[chex.Array]
     musics: t.List[chex.Array] = dataclasses.field(default_factory=list)
     actions: t.List[chex.Array] = dataclasses.field(default_factory=list)
     terminals: t.List[chex.Array] = dataclasses.field(default_factory=list)
-    policy_outputs: t.List[
-        t.Tuple[MusicPolicyOutput, hk.LSTMState]
-    ] = dataclasses.field(default_factory=list)
-    predictor_outputs: t.List[t.Tuple[Normal, hk.LSTMState]] = dataclasses.field(
-        default_factory=list
-    )
+    policy_outputs: t.List[MusicPolicyOutput] = dataclasses.field(default_factory=list)
+    policy_hiddens: t.List[hk.LSTMState] = dataclasses.field(default_factory=list)
+    predictor_outputs: t.List[Normal] = dataclasses.field(default_factory=list)
+    predictor_hiddens: t.List[hk.LSTMState] = dataclasses.field(default_factory=list)
 
     def append(
         self,
@@ -282,7 +255,9 @@ class RolloutWithMusic:
         music: chex.Array,
         action: chex.Array,
         policy_out: MusicPolicyOutput,
+        policy_hidden: hk.LSTMState,
         predictor_out: Normal,
+        predictor_hidden: hk.LSTMState,
         terminal: chex.Array,
     ) -> None:
         self.observations.append(observation)
@@ -310,10 +285,11 @@ class MusicBatch(t.NamedTuple):
     next_observation: chex.Array
     music: chex.Array
     action: chex.Array
-    reward: chex.Array
     advantage: chex.Array
     value_target: chex.Array
     log_prob: chex.Array
+    policy_hidden: hk.LSTMState
+    predictor_hidden: hk.LSTMState
 
     def __getitem__(self, idx: Array) -> Self:
         return self.__class__(
@@ -326,123 +302,137 @@ class MusicBatch(t.NamedTuple):
         )
 
 
+@functools.partial(jax.jit, static_argnums=2)
 def _make_music_batch(
     rollout: RolloutWithMusic,
     next_value: chex.Array,
     config: Config,
 ) -> MusicBatch:
-    action = jnp.concatenate(rollout.actions)
-    policy_outputs = jax.tree_map(lambda *x: jnp.concatenate(x), *rollout.outputs)
-    log_prob = policy_outputs.as_distrax().log_prob(action)
-    reward = jnp.stack(rollout.rewards) * config.reward_scaling
+    # Observation
+    observation = jnp.stack(rollout.observations)  # T, N, obs-dim
+    # Compute rewards
+    predictor = jax.tree_map(lambda *x: jnp.stack(x), *rollout.predictor_outputs)
+    marginal_logp = predictor.as_distrax().log_prob(observation[1:])
+    policy_outputs = jax.tree_map(lambda *x: jnp.stack(x), *rollout.policy_outputs)
+    conditional_logp = policy_outputs.pred.as_distrax().log_prob(observation[1:])
+    raw_rewards = conditional_logp - marginal_logp
+    reward = jnp.clip(raw_rewards, a_min=config.min_r, a_max=config.max_r)
+    # Compute advantage
     mask = 1.0 - jnp.stack(rollout.terminals)
     value = jnp.concatenate(
-        (value.reshape(reward.shape), next_value.reshape(1, -1)),
+        (policy_outputs.value.reshape(reward.shape), next_value.reshape(1, -1)),
         axis=0,
     )
     advantage = batched_gae(reward, mask * config.gamma, config.gae_lambda, value)
     value_target = advantage + value[:-1]
-    if config.normalize_adv:
-        advantage = (advantage - jnp.mean(advantage)) / (jnp.std(advantage) + 1e-8)
-    return Batch(
-        observation=jnp.concatenate(rollout.observations[:-1]),
+    # Log π
+    action = jnp.stack(rollout.actions)
+    log_prob = policy_outputs.policy.as_distrax().log_prob(action)
+    return MusicBatch(
+        observation=observation[:-1],
+        next_observation=observation[1:],
+        music=jnp.stack(rollout.musics),
         action=action,
-        reward=jnp.ravel(reward),
-        advantage=jnp.ravel(advantage),
-        value_target=jnp.ravel(value_target),
+        advantage=advantage,
+        value_target=value_target,
         log_prob=log_prob,
+        policy_hidden=jax.tree_map(lambda *x: jnp.stack(x), rollout.policy_hiddens),
+        predictor_hidden=jax.tree_map(
+            lambda *x: jnp.stack(x),
+            rollout.predictor_hiddens,
+        ),
     )
 
 
-@dataclasses.dataclass
-class RolloutResult:
-    """
-    Required experiences for PPO.
-    """
-
-    observations: t.List[chex.Array]
-    actions: t.List[chex.Array] = dataclasses.field(default_factory=list)
-    rewards: t.List[chex.Array] = dataclasses.field(default_factory=list)
-    terminals: t.List[chex.Array] = dataclasses.field(default_factory=list)
-    outputs: t.List[GaussianAndValue] = dataclasses.field(default_factory=list)
-
-    def append(
-        self,
-        *,
-        observation: chex.Array,
-        action: chex.Array,
-        reward: chex.Array,
-        output: GaussianAndValue,
-        terminal: chex.Array,
-    ) -> None:
-        self.observations.append(observation)
-        self.actions.append(action)
-        self.rewards.append(reward)
-        self.outputs.append(output)
-        self.terminals.append(terminal)
-
-    def last_obs(self) -> chex.Array:
-        assert len(self.observations) == len(self.actions) + 1
-        return self.observations[-1]
-
-    def clear(self) -> None:
-        self.observations = [self.last_obs()]
-        self.actions.clear()
-        self.rewards.clear()
-        self.outputs.clear()
-        self.terminals.clear()
-
-
-class Batch(t.NamedTuple):
-    """Batch for PPO, also used as minibatch by indexing."""
-
-    observation: chex.Array
-    action: chex.Array
-    reward: chex.Array
-    advantage: chex.Array
-    value_target: chex.Array
-    log_prob: chex.Array
-
-    def __getitem__(self, idx: Array) -> Self:
-        return self.__class__(
-            observation=self.observation[idx],
-            action=self.action[idx],
-            reward=self.reward[idx],
-            advantage=self.advantage[idx],
-            value_target=self.value_target[idx],
-            log_prob=self.log_prob[idx],
-        )
-
-
-def _make_batch(
-    rollout: RolloutResult,
-    next_value: chex.Array,
-    config: Config,
-) -> Batch:
-    action = jnp.concatenate(rollout.actions)
-    mu, stddev, value = jax.tree_map(lambda *x: jnp.concatenate(x), *rollout.outputs)
-    log_prob = distrax.MultivariateNormalDiag(mu, stddev).log_prob(action)
-    reward = jnp.stack(rollout.rewards) * config.reward_scaling
-    mask = 1.0 - jnp.stack(rollout.terminals)
-    value = jnp.concatenate(
-        (value.reshape(reward.shape), next_value.reshape(1, -1)),
-        axis=0,
-    )
-    advantage = batched_gae(reward, mask * config.gamma, config.gae_lambda, value)
-    value_target = advantage + value[:-1]
-    if config.normalize_adv:
-        advantage = (advantage - jnp.mean(advantage)) / (jnp.std(advantage) + 1e-8)
-    return Batch(
-        observation=jnp.concatenate(rollout.observations[:-1]),
-        action=action,
-        reward=jnp.ravel(reward),
-        advantage=jnp.ravel(advantage),
-        value_target=jnp.ravel(value_target),
-        log_prob=log_prob,
-    )
-
-
+@chex.dataclass
 class Actor:
+    policy_params: hk.Params
+    predictor_params: hk.Params
+    policy_state: hk.LSTMState
+    predictor_state: hk.LSTMState
+    prev_terminal: chex.Array
+
+
+class MusicIter:
+    def __init__(
+        self,
+        musics: t.List[chex.Array],
+        n_workers: int,
+        prng_key: chex.PRNGKey,
+    ) -> None:
+        self._musics = np.array(musics)
+        self._n_workers = n_workers
+        self._n_musics = len(musics)
+        self._selected = list(
+            jax.random.choice(prng_key, self._n_musics, shape=(n_workers,))
+        )
+        self._indices = [0] * self._n_musics
+
+    def next_music(self) -> t.Tuple[chex.Array, chex.Array]:
+        selected = [self._musics[i][j] for i, j in zip(self._selected, self._indices)]
+        for i in self._n_workers:
+            if len(self._musics[self._selected[i]]) <= self._indices[i]:
+                self._indices[i] = 0
+                self._selected[i] = jax.random.choice(
+                    hk.next_rng(),
+                    self._n_musics,
+                ).item()
+        return jnp.stack(selected)
+
+
+def make_onestep_fn(
+    env: Env,
+    n_pitches: int,
+    config: Config,
+) -> hk.Transformed:
+    def step_impl(
+        state: BraxState,
+        policy_state: t.Optional[hk.LSTMState],
+        predictor_state: t.Optional[hk.LSTMState],
+        music: chex.Array,
+        prev_terminal: chex.Array,
+    ) -> t.Tuple[
+        BraxState,
+        chex.Array,
+        MusicPolicyOutput,
+        hk.LSTMState,
+        Normal,
+        hk.LSTMState,
+    ]:
+        mask = 1.0 - prev_terminal
+        obs_predictor = ObsPredictor(obs_dim=env.observation_size, config=Config)
+        predictor_out, predictor_state = obs_predictor(
+            (state.obs, mask),
+            predictor_state,
+        )
+        music_policy = MusicPolicy(
+            action_dim=env.action_size,
+            obs_dim=env.observation_size,
+            n_pitches=n_pitches,
+            config=Config,
+        )
+        policy_out, policy_state = music_policy(
+            (state.obs, music, mask),
+            policy_state,
+        )
+        action = policy_out.policy.as_distrax().sample(seed=hk.next_rng_key())
+        resetted_state = env.reset(hk.next_rng_key())
+        state = jax.tree_map(
+            lambda old, new: jnp.where(
+                prev_terminal.reshape((old.shape[0],) + (1,) * (old.ndim - 1)),
+                new,
+                old,
+            ),
+            state,
+            resetted_state,
+        )
+        state = env.step(state, jnp.tanh(action))
+        return state, action, policy_out, policy_state, predictor_out, predictor_state
+
+    return hk.transform(step_impl)
+
+
+class Actor2:
     def __init__(
         self,
         *,
@@ -457,9 +447,7 @@ class Actor:
 
     @staticmethod
     def make_step_fn(env: Env) -> hk.Transformed:
-        def step_impl(
-            state: BraxState,
-        ) -> t.Tuple[BraxState, chex.Array, GaussianAndValue]:
+        def step_impl(state: BraxState):
             output = MLPPolicy(action_dim=env.action_size, config=Config)(state.obs)
             policy = distrax.MultivariateNormalDiag(output.mu, output.stddev)
             action = policy.sample(seed=hk.next_rng_key())
@@ -468,11 +456,7 @@ class Actor:
 
         return hk.transform(step_impl)
 
-    def step(
-        self,
-        prng_key: chex.PRNGKey,
-        state: BraxState,
-    ) -> t.Tuple[chex.Array, GaussianAndValue]:
+    def step(self, prng_key: chex.PRNGKey, state: BraxState):
         return self._step_impl(self.params, prng_key, state)
 
 
@@ -497,11 +481,7 @@ class Learner:
         _, _, next_value = jax.lax.stop_gradient(self._pi_and_v(params, last_obs))
         return next_value
 
-    def learn(
-        self,
-        rollout_result: RolloutResult,
-        prng_seq: hk.PRNGSequence,
-    ) -> Batch:
+    def learn(self, rollout_result, prng_seq):
         next_value = self._next_value(self._actor.params, rollout_result.last_obs())
         batch = _make_batch(rollout_result, next_value, self._config)
         n_batches = batch.reward.shape[0]
@@ -521,16 +501,13 @@ class Learner:
 
     @functools.partial(jax.jit, static_argnums=0)
     def _update(
-        self,
-        params: hk.Params,
-        opt_state: optax.OptState,
-        ppo_batch: Batch,
+        self, params: hk.Params, opt_state: optax.OptState, ppo_batch
     ) -> t.Tuple[hk.Params, optax.OptState]:
         g = jax.grad(self._loss)(params, ppo_batch)
         updates, new_opt_state = self._opt_update(g, opt_state)
         return optax.apply_updates(params, updates), new_opt_state
 
-    def _loss(self, params: hk.Params, batch: Batch) -> chex.Array:
+    def _loss(self, params: hk.Params, batch) -> chex.Array:
         mu, stddev, value = self._pi_and_v(params, batch.observation)
 
         # Policy loss
@@ -552,7 +529,7 @@ class Learner:
         return policy_loss + value_loss - self._config.entropy_coef * entropy_mean
 
 
-def _musics_to_one_hots(musics: t.List[muspy.Music]) -> t.List[chex.Array]:
+def _to_pitches(musics: t.List[muspy.Music]) -> t.List[chex.Array]:
     pitches = [muspy.to_pitch_representation(music) for music in musics]
     min_value = min([np.min(pitch) for pitch in pitches])
     return [jnp.array(pitch - min_value) for pitch in pitches]
@@ -560,10 +537,10 @@ def _musics_to_one_hots(musics: t.List[muspy.Music]) -> t.List[chex.Array]:
 
 def load_jsb(root: str) -> t.List[chex.Array]:
     jsb = muspy.JSBChoralesDataset(root, download_and_extract=True).convert()
-    return _musics_to_one_hots(jsb)
+    return _to_pitches(jsb)
 
 
-def test_ppo() -> None:
+def train() -> None:
     env = create_brax_env(
         env_name="ant",
         episode_length=1000,
@@ -592,7 +569,10 @@ def test_ppo() -> None:
         action_dim=env.action_size,
         config=config,
         actor=actor,
-        optimizer=optax.adam(3e-4, eps=1e-4),
+        optimizer=optax.chain(
+            optax.clip_by_global_norm(1.0),
+            optax.adam(3e-4, eps=1e-4),
+        ),
     )
     rollout = RolloutResult([state.obs])
     for i in range(1000):
@@ -626,6 +606,5 @@ if __name__ == "__main__":
     import typer
 
     app = typer.Typer()
-    app.command()(test_audio_processing)
-    app.command()(test_ppo)
+    app.command()(train)
     app()
