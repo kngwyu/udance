@@ -3,7 +3,6 @@
 
 import dataclasses
 import functools
-import pathlib
 import typing as t
 
 import chex
@@ -11,15 +10,13 @@ import distrax
 import haiku as hk
 import jax
 import jax.numpy as jnp
-import librosa
+import muspy
 import numpy as np
 import optax
 import rlax
-import soundfile as sf
 
 from brax.envs import Env, State as BraxState, create as create_brax_env
 from brax.io import html as brax_html
-from tqdm.auto import tqdm
 
 np.Array = chex.Array
 Array = t.Union[chex.Array, np.Array]
@@ -41,7 +38,9 @@ class Config:
     normalize_adv: bool = False
     reward_scaling: float = 1.0
     # Network config
-    mlp_hidden_units: t.Sequence[int] = (64, 64)
+    hidden_dims: t.Sequence[int] = (64, 64)
+    rnn_hidden_dim: int = 64
+    drop_prob: float = 0.5
 
 
 class GaussianAndValue(t.NamedTuple):
@@ -50,30 +49,39 @@ class GaussianAndValue(t.NamedTuple):
     value: chex.Array
 
 
+def orthogonal(scale: float = 5.0 / 3.0) -> hk.initializers.Orthogonal:
+    return hk.initializers.Orthogonal(scale=scale)
+
+
+def mlp(
+    hidden_dims: t.Sequence[int],
+    last_dim: int,
+    last_scale: float = 1.0,
+) -> t.List[hk.Module]:
+    layers = [
+        hk.nets.MLP(
+            hidden_dims,
+            w_init=orthogonal(),
+            activation=jax.nn.tanh,
+            activate_final=True,
+        ),
+        hk.Linear(last_dim, w_init=orthogonal(scale=last_scale)),
+    ]
+    return hk.Sequential(layers)
+
+
 class MLPPolicy(hk.Module):
+    """MLP Gaussian policy with tunable stddev"""
+
     def __init__(self, action_dim: int, config: Config) -> None:
         super().__init__(name="diag_gaussian_pi_and_v")
 
-        def build(last_layer: hk.Linear) -> t.List[hk.Module]:
-            return [
-                hk.Flatten(),
-                hk.nets.MLP(
-                    config.mlp_hidden_units,
-                    w_init=hk.initializers.Orthogonal(scale=jnp.sqrt(2.0)),
-                    activation=jax.nn.tanh,
-                    activate_final=True,
-                ),
-                last_layer,
-            ]
-
-        self._mu_net = hk.Sequential(
-            build(hk.Linear(action_dim, w_init=hk.initializers.Orthogonal(scale=0.01)))
-        )
-        self._value_net = hk.Sequential(
-            build(hk.Linear(1, w_init=hk.initializers.Orthogonal(scale=1.0)))
-        )
+        self._mu_net = mlp(config.hidden_dims, action_dim, 0.01)
+        self._value_net = mlp(config.hidden_dims, 1, 1.0)
         self._logstd_param = hk.get_parameter(
-            "logstd", (1, action_dim), init=lambda shape, dtype: jnp.zeros(shape, dtype)
+            "logstd",
+            (1, action_dim),
+            init=lambda shape, dtype: jnp.zeros(shape, dtype),
         )
 
     def __call__(self, observation: Array) -> GaussianAndValue:
@@ -81,6 +89,141 @@ class MLPPolicy(hk.Module):
         stddev = jnp.ones_like(mu) * jnp.exp(self._logstd_param)
         value = self._value_net(observation)
         return GaussianAndValue(mu, stddev, value)
+
+
+class Normal(t.NamedTuple):
+    mean: chex.Array
+    stddev: chex.Array
+
+    def as_distrax(self) -> distrax.MultivariateNormalDiag:
+        return distrax.MultivariateNormalDiag(loc=self.mean, scale_diag=self.stddev)
+
+
+class LogstdNormal(hk.Module):
+    def __init__(
+        self,
+        output_dim: int,
+        w_init: t.Optional[callable] = None,
+        name: t.Optional[str] = None,
+    ) -> None:
+        super().__init__(name=name)
+        self._mean = hk.Linear(output_dim, w_init=w_init)
+        self._logstd = hk.Linear(output_dim, w_init=w_init)
+
+    def __call__(self, x: chex.Array) -> Normal:
+        mean = self._mean(x)
+        logstd = self._logstd(x)
+        return Normal(mean=mean, stddev=jnp.exp(logstd * 0.5))
+
+
+class MusicPolicyOutput(t.NamedTuple):
+    policy: Normal
+    value: chex.Array
+    pred: Normal
+
+
+class MusicPolicy(hk.RNNCore):
+    """Recurrent policy conditioned by music"""
+
+    def __init__(
+        self,
+        action_dim: int,
+        obs_dim: int,
+        n_pitches: int,
+        config: Config,
+    ) -> None:
+        super().__init__(name="music_policy")
+        self._music_encoder = hk.Embed(
+            vocab_size=n_pitches,
+            embed_dim=config.rnn_hidden_dim,
+            w_init=orthogonal(1.0),
+        )
+        self._obs_encoder = hk.Linear(config.rnn_hidden_dim, w_init=orthogonal(1.0))
+        self._lstm = hk.LSTM(config.rnn_hidden_dim)
+        self._pi_mean = mlp(config.hidden_dims, action_dim, 0.01)
+        self._value = mlp(config.hidden_dims, 1, 1.0)
+        self._logstd_param = hk.get_parameter(
+            "logstd",
+            (1, action_dim),
+            init=lambda shape, dtype: jnp.zeros(shape, dtype),
+        )
+        self._pi_logstd = hk.get_parameter(
+            "logstd",
+            (1, action_dim),
+            init=lambda shape, dtype: jnp.zeros(shape, dtype),
+        )
+        self._pre_pred = hk.nets.MLP(
+            config.hidden_dims,
+            w_init=orthogonal(),
+            activation=jax.nn.tanh,
+            activate_final=True,
+        )
+        self._pred = LogstdNormal(obs_dim, w_init=hk.initializers.Orthogonal(scale=1.0))
+        self._drop_prob = config.drop_prob
+
+    def initial_state(self, batch_size: t.Optional[int]) -> hk.LSTMState:
+        return self._lstm.initial_state(batch_size)
+
+    def __call__(
+        self,
+        inputs: t.Tuple[chex.Array, chex.Array, chex.Array],
+        prev_state: t.Optional[hk.LSTMState] = None,
+    ) -> t.Tuple[MusicPolicyOutput, hk.LSTMState]:
+        obs, music, rnn_mask = inputs
+        if prev_state is None:
+            prev_state = self.initial_state(obs.shape[0])
+        obs_encoded = self._obs_encoder(obs)
+        music_encoded = self._music_encoder(music)
+        music_encoded_dropped = hk.dropout(
+            hk.next_rng_key(),
+            self._drop_prob,
+            music_encoded,
+        )
+        post_rnn, next_state = self._lstm(
+            jnp.concatenate((obs_encoded, music_encoded_dropped), axis=1),
+            jax.tree_map(lambda x: x * rnn_mask, prev_state),
+        )
+        post_rnn_dropped = hk.dropout(hk.next_rng_key(), self._drop_prob, post_rnn)
+        pi_mean = self._pi_mean(post_rnn_dropped)
+        pi_std = jnp.ones_like(pi_mean) * jnp.exp(self._logstd_param)
+        value = self._value(post_rnn_dropped)
+        pred = self._pred(self._pre_pred(post_rnn_dropped))
+        return MusicPolicyOutput(Normal(pi_mean, pi_std), value, pred), next_state
+
+
+class ObsPredictor(hk.RNNCore):
+    """Predict the next state"""
+
+    def __init__(self, obs_dim: int, config: Config) -> None:
+        super().__init__(name="obs_predictor")
+        self._obs_encoder = hk.Linear(config.rnn_hidden_dim, w_init=orthogonal(1.0))
+        self._lstm = hk.LSTM(config.rnn_hidden_dim)
+        self._mlp = hk.nets.MLP(
+            config.hidden_dims,
+            w_init=orthogonal(),
+            activation=jax.nn.tanh,
+            activate_final=True,
+        )
+        self._pred = LogstdNormal(obs_dim, w_init=hk.initializers.Orthogonal(scale=1.0))
+
+    def initial_state(self, batch_size: t.Optional[int]) -> hk.LSTMState:
+        return self._lstm.initial_state(batch_size)
+
+    def __call__(
+        self,
+        inputs: t.Tuple[chex.Array, chex.Array, chex.Array],
+        prev_state: t.Optional[hk.LSTMState] = None,
+    ) -> t.Tuple[Normal, hk.LSTMState]:
+        obs, rnn_mask = inputs
+        if prev_state is None:
+            prev_state = self.initial_state(obs.shape[0])
+        obs_encoded = self._obs_encoder(obs)
+        post_rnn, next_state = self._lstm(
+            obs_encoded,
+            jax.tree_map(lambda x: x * rnn_mask, prev_state),
+        )
+        pred = self._pred(self._mlp(post_rnn))
+        return pred, next_state
 
 
 def sample_minibatch_indices(
@@ -117,6 +260,98 @@ def _gae_impl(
 
 
 batched_gae = jax.vmap(_gae_impl, in_axes=(1, 1, None, 1), out_axes=1)
+
+
+@dataclasses.dataclass
+class RolloutWithMusic:
+    observations: t.List[chex.Array]
+    musics: t.List[chex.Array] = dataclasses.field(default_factory=list)
+    actions: t.List[chex.Array] = dataclasses.field(default_factory=list)
+    terminals: t.List[chex.Array] = dataclasses.field(default_factory=list)
+    policy_outputs: t.List[
+        t.Tuple[MusicPolicyOutput, hk.LSTMState]
+    ] = dataclasses.field(default_factory=list)
+    predictor_outputs: t.List[t.Tuple[Normal, hk.LSTMState]] = dataclasses.field(
+        default_factory=list
+    )
+
+    def append(
+        self,
+        *,
+        observation: chex.Array,
+        music: chex.Array,
+        action: chex.Array,
+        policy_out: MusicPolicyOutput,
+        predictor_out: Normal,
+        terminal: chex.Array,
+    ) -> None:
+        self.observations.append(observation)
+        self.musics.append(music)
+        self.actions.append(action)
+        self.policy_outputs.append(policy_out)
+        self.predictor_outputs.append(predictor_out)
+        self.terminals.append(terminal)
+
+    def last_obs(self) -> chex.Array:
+        assert len(self.observations) == len(self.actions) + 1
+        return self.observations[-1]
+
+    def clear(self) -> None:
+        self.observations = [self.last_obs()]
+        self.musics.clear()
+        self.actions.clear()
+        self.policy_outputs.clear()
+        self.predictor_outputs.clear()
+        self.terminals.clear()
+
+
+class MusicBatch(t.NamedTuple):
+    observation: chex.Array
+    next_observation: chex.Array
+    music: chex.Array
+    action: chex.Array
+    reward: chex.Array
+    advantage: chex.Array
+    value_target: chex.Array
+    log_prob: chex.Array
+
+    def __getitem__(self, idx: Array) -> Self:
+        return self.__class__(
+            observation=self.observation[idx],
+            action=self.action[idx],
+            reward=self.reward[idx],
+            advantage=self.advantage[idx],
+            value_target=self.value_target[idx],
+            log_prob=self.log_prob[idx],
+        )
+
+
+def _make_music_batch(
+    rollout: RolloutWithMusic,
+    next_value: chex.Array,
+    config: Config,
+) -> MusicBatch:
+    action = jnp.concatenate(rollout.actions)
+    policy_outputs = jax.tree_map(lambda *x: jnp.concatenate(x), *rollout.outputs)
+    log_prob = policy_outputs.as_distrax().log_prob(action)
+    reward = jnp.stack(rollout.rewards) * config.reward_scaling
+    mask = 1.0 - jnp.stack(rollout.terminals)
+    value = jnp.concatenate(
+        (value.reshape(reward.shape), next_value.reshape(1, -1)),
+        axis=0,
+    )
+    advantage = batched_gae(reward, mask * config.gamma, config.gae_lambda, value)
+    value_target = advantage + value[:-1]
+    if config.normalize_adv:
+        advantage = (advantage - jnp.mean(advantage)) / (jnp.std(advantage) + 1e-8)
+    return Batch(
+        observation=jnp.concatenate(rollout.observations[:-1]),
+        action=action,
+        reward=jnp.ravel(reward),
+        advantage=jnp.ravel(advantage),
+        value_target=jnp.ravel(value_target),
+        log_prob=log_prob,
+    )
 
 
 @dataclasses.dataclass
@@ -317,89 +552,15 @@ class Learner:
         return policy_loss + value_loss - self._config.entropy_coef * entropy_mean
 
 
-class WavData(t.NamedTuple):
-    mel: chex.Array
-    wav: chex.Array
-    sample_rate: int
+def _musics_to_one_hots(musics: t.List[muspy.Music]) -> t.List[chex.Array]:
+    pitches = [muspy.to_pitch_representation(music) for music in musics]
+    min_value = min([np.min(pitch) for pitch in pitches])
+    return [jnp.array(pitch - min_value) for pitch in pitches]
 
 
-def wav2mel(
-    wav: np.Array,
-    sample_rate: int,
-    n_fft: int = 1024,
-    hop_length: int = 256,
-    win_length: int = 1024,
-    n_mels: int = 80,
-    fmin: int = 0,
-    fmax: int = 8000,
-) -> np.Array:
-    mel = librosa.feature.melspectrogram(
-        librosa.to_mono(wav),
-        sr=sample_rate,
-        n_fft=n_fft,
-        hop_length=hop_length,
-        win_length=win_length,
-        window="hann",
-        center=True,
-        n_mels=n_mels,
-        fmin=fmin,
-        fmax=fmax,
-        power=1,
-    )
-    mel = np.log(mel + 1e-5)
-    return mel
-
-
-def load_data_on_memory(
-    wav_dir: pathlib.Path,
-) -> t.List[WavData]:
-    # load all data files on memory
-    dataset = []
-    for fp in tqdm(sorted(wav_dir.glob("*.wav"))):
-        wav, sr = sf.read(fp, dtype="int16")
-        mel = wav2mel(wav.astype(np.float32) / 2 ** 15, sample_rate=sr)
-        dataset.append(WavData(mel=jnp.array(mel), wav=jnp.array(wav), sample_rate=sr))
-    return dataset
-
-
-def create_data_iter(
-    dataset: t.List[WavData],
-    prng_seq: hk.PRNGSequence,
-    seq_len: int,
-    batch_size: int,
-    hop_length: int = 256,
-) -> t.Iterable[t.Tuple[np.Array, np.Array]]:
-
-    batch = []
-    while True:
-        indices = jax.random.permutation(next(prng_seq), len(dataset))
-        for mel, wav, _sr in map(lambda idx: dataset[idx], indices):
-            r_idx = jax.random.randint(
-                next(prng_seq),
-                shape=(),
-                minval=seq_len,
-                maxval=mel.shape[1] - 1,
-            )
-            l_idx = seq_len - r_idx
-            batch.append(
-                (mel[:, l_idx:r_idx], wav[l_idx * hop_length : r_idx * hop_length])
-            )
-            if len(batch) == batch_size:
-                mel_batch, wav_batch = jax.tree_map(
-                    lambda *array: jnp.stack(array),
-                    *batch,
-                )
-                yield jnp.swapaxes(mel_batch, 1, 2), wav_batch
-                batch.clear()
-
-
-def test_audio_processing(wave_dir: str) -> None:
-    data = load_data_on_memory(pathlib.Path(wave_dir))
-    prng_seq = hk.PRNGSequence(0)
-    data_iter = create_data_iter(data, prng_seq, 100, 64)
-    for i in range(5):
-        mel, wav = next(data_iter)
-        print(mel.shape, wav.shape)
+def load_jsb(root: str) -> t.List[chex.Array]:
+    jsb = muspy.JSBChoralesDataset(root, download_and_extract=True).convert()
+    return _musics_to_one_hots(jsb)
 
 
 def test_ppo() -> None:
