@@ -27,3 +27,4 @@ python udance.py train
 - [numpy](https://numpy.org/)
 - [optax](https://github.com/deepmind/optax)
 - [rlax](https://github.com/deepmind/rlax)
+- [typer](https://typer.tiangolo.com/)

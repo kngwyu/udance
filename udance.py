@@ -1,8 +1,8 @@
-"""Based on https://github.com/NTT123/wavernn-16bit
-"""
-
+import collections
 import dataclasses
 import functools
+import json
+import pathlib
 import typing as t
 
 import chex
@@ -23,6 +23,19 @@ Array = t.Union[chex.Array, np.Array]
 
 NetworkOutput = t.Any
 Self = t.Any
+
+batched_ppoclip_loss = jax.vmap(
+    functools.partial(rlax.clipped_surrogate_pg_loss, use_stop_gradient=False),
+    in_axes=(0, 0, None),
+    out_axes=0,
+)
+
+
+def select_if(obj: t.Optional[t.Any], idx: t.Any) -> t.Optional[t.Any]:
+    if obj is None:
+        return None
+    else:
+        return obj[idx]
 
 
 @dataclasses.dataclass(frozen=True)
@@ -98,7 +111,7 @@ class MusicPolicyOutput(t.NamedTuple):
 
 
 class MusicPolicy(hk.RNNCore):
-    """Recurrent policy conditioned by music"""
+    """π(Xt+1|Xt, Yt, Xt-1, ...) & P(Xt+1|Xt, Yt Xt-1, ...)"""
 
     def __init__(
         self,
@@ -156,7 +169,7 @@ class MusicPolicy(hk.RNNCore):
         )
         post_rnn, next_state = self._lstm(
             jnp.concatenate((obs_encoded, music_encoded_dropped), axis=1),
-            jax.tree_map(lambda x: x * rnn_mask, prev_state),
+            jax.tree_map(lambda x: x * rnn_mask.reshape(-1, 1), prev_state),
         )
         post_rnn_dropped = hk.dropout(hk.next_rng_key(), self._drop_prob, post_rnn)
         pi_mean = self._pi_mean(post_rnn_dropped)
@@ -167,7 +180,7 @@ class MusicPolicy(hk.RNNCore):
 
 
 class ObsPredictor(hk.RNNCore):
-    """Predict the next state"""
+    """P(Xt+1|Xt, Xt-1, ...)"""
 
     def __init__(self, obs_dim: int, config: Config) -> None:
         super().__init__(name="obs_predictor")
@@ -195,30 +208,32 @@ class ObsPredictor(hk.RNNCore):
         obs_encoded = self._obs_encoder(obs)
         post_rnn, next_state = self._lstm(
             obs_encoded,
-            jax.tree_map(lambda x: x * rnn_mask, prev_state),
+            jax.tree_map(lambda x: x * rnn_mask.reshape(-1, 1), prev_state),
         )
         pred = self._pred(self._mlp(post_rnn))
         return pred, next_state
 
 
-def sample_minibatch_indices(
-    n_instances: int,
+def sample_workers(
+    n_workers: int,
     n_minibatches: int,
     rng_key: chex.Array,
 ) -> t.Iterable[chex.Array]:
-    indices = jax.random.permutation(rng_key, n_instances)
-    minibatch_size = n_instances // n_minibatches
-    for start in range(0, n_instances, minibatch_size):
-        yield indices[start : start + minibatch_size]
+    assert n_workers % n_minibatches == 0
+    indices = jax.random.permutation(rng_key, n_workers)
+    n_workers_per_batch = n_workers // n_minibatches
+    for start in range(0, n_workers, n_workers_per_batch):
+        yield indices[start : start + n_workers_per_batch]
 
 
-@functools.partial(jax.jit, static_argnums=2)
+@jax.jit
 def _gae_impl(
     r_t: chex.Array,
     discount_t: chex.Array,
     lambda_: float,
     values: chex.Array,
 ) -> chex.Array:
+    """A fast implementation of Generalized Advantage Estimator"""
     chex.assert_rank([r_t, values, discount_t], 1)
     chex.assert_type([r_t, values, discount_t], float)
     lambda_ = jnp.ones_like(discount_t) * lambda_
@@ -234,19 +249,20 @@ def _gae_impl(
     return advantage_t[:-1]
 
 
+# Here I assume that value and reward have (T, N) shape
 batched_gae = jax.vmap(_gae_impl, in_axes=(1, 1, None, 1), out_axes=1)
 
 
 @chex.dataclass
 class RolloutWithMusic:
+    """A container class that holds the result of N-step rollout"""
+
     observations: t.List[chex.Array]
     musics: t.List[chex.Array] = dataclasses.field(default_factory=list)
     actions: t.List[chex.Array] = dataclasses.field(default_factory=list)
     terminals: t.List[chex.Array] = dataclasses.field(default_factory=list)
     policy_outputs: t.List[MusicPolicyOutput] = dataclasses.field(default_factory=list)
-    policy_hiddens: t.List[hk.LSTMState] = dataclasses.field(default_factory=list)
     predictor_outputs: t.List[Normal] = dataclasses.field(default_factory=list)
-    predictor_hiddens: t.List[hk.LSTMState] = dataclasses.field(default_factory=list)
 
     def append(
         self,
@@ -255,9 +271,7 @@ class RolloutWithMusic:
         music: chex.Array,
         action: chex.Array,
         policy_out: MusicPolicyOutput,
-        policy_hidden: hk.LSTMState,
         predictor_out: Normal,
-        predictor_hidden: hk.LSTMState,
         terminal: chex.Array,
     ) -> None:
         self.observations.append(observation)
@@ -288,17 +302,18 @@ class MusicBatch(t.NamedTuple):
     advantage: chex.Array
     value_target: chex.Array
     log_prob: chex.Array
-    policy_hidden: hk.LSTMState
-    predictor_hidden: hk.LSTMState
+    mask: chex.Array
 
     def __getitem__(self, idx: Array) -> Self:
         return self.__class__(
-            observation=self.observation[idx],
-            action=self.action[idx],
-            reward=self.reward[idx],
-            advantage=self.advantage[idx],
-            value_target=self.value_target[idx],
-            log_prob=self.log_prob[idx],
+            observation=self.observation[:, idx],
+            next_observation=self.next_observation[:, idx],
+            music=self.music[:, idx],
+            action=self.action[:, idx],
+            advantage=self.advantage[:, idx],
+            value_target=self.value_target[:, idx],
+            log_prob=self.log_prob[:, idx],
+            mask=self.mask[:, idx],
         )
 
 
@@ -336,48 +351,8 @@ def _make_music_batch(
         advantage=advantage,
         value_target=value_target,
         log_prob=log_prob,
-        policy_hidden=jax.tree_map(lambda *x: jnp.stack(x), rollout.policy_hiddens),
-        predictor_hidden=jax.tree_map(
-            lambda *x: jnp.stack(x),
-            rollout.predictor_hiddens,
-        ),
+        mask=mask,
     )
-
-
-@chex.dataclass
-class Actor:
-    policy_params: hk.Params
-    predictor_params: hk.Params
-    policy_state: hk.LSTMState
-    predictor_state: hk.LSTMState
-    prev_terminal: chex.Array
-
-
-class MusicIter:
-    def __init__(
-        self,
-        musics: t.List[chex.Array],
-        n_workers: int,
-        prng_key: chex.PRNGKey,
-    ) -> None:
-        self._musics = np.array(musics)
-        self._n_workers = n_workers
-        self._n_musics = len(musics)
-        self._selected = list(
-            jax.random.choice(prng_key, self._n_musics, shape=(n_workers,))
-        )
-        self._indices = [0] * self._n_musics
-
-    def next_music(self) -> t.Tuple[chex.Array, chex.Array]:
-        selected = [self._musics[i][j] for i, j in zip(self._selected, self._indices)]
-        for i in self._n_workers:
-            if len(self._musics[self._selected[i]]) <= self._indices[i]:
-                self._indices[i] = 0
-                self._selected[i] = jax.random.choice(
-                    hk.next_rng(),
-                    self._n_musics,
-                ).item()
-        return jnp.stack(selected)
 
 
 def make_onestep_fn(
@@ -429,35 +404,40 @@ def make_onestep_fn(
         state = env.step(state, jnp.tanh(action))
         return state, action, policy_out, policy_state, predictor_out, predictor_state
 
-    return hk.transform(step_impl)
+    return jax.tree_map(jax.jit, hk.transform(step_impl))
 
 
-class Actor2:
-    def __init__(
+@chex.dataclass
+class Actor:
+    params: hk.Params
+    policy_state: t.Optional[hk.LSTMState]
+    predictor_state: t.Optional[hk.LSTMState]
+
+    def step(
         self,
-        *,
-        env: Env,
-        config: Config,
-        net_init_key: chex.PRNGKey,
-        initial_state: chex.Array,
-    ) -> None:
-        init, step_transformed = self.make_step_fn(env)
-        self.params = init(net_init_key, initial_state)
-        self._step_impl = jax.jit(step_transformed)
-
-    @staticmethod
-    def make_step_fn(env: Env) -> hk.Transformed:
-        def step_impl(state: BraxState):
-            output = MLPPolicy(action_dim=env.action_size, config=Config)(state.obs)
-            policy = distrax.MultivariateNormalDiag(output.mu, output.stddev)
-            action = policy.sample(seed=hk.next_rng_key())
-            state = env.step(state, jnp.tanh(action))
-            return state, action, output
-
-        return hk.transform(step_impl)
-
-    def step(self, prng_key: chex.PRNGKey, state: BraxState):
-        return self._step_impl(self.params, prng_key, state)
+        onestep_fn: t.Callable[..., t.Any],
+        state: BraxState,
+        music: chex.Array,
+        prng_key: chex.PRNGKey,
+        prev_terminal: chex.Array,
+    ) -> t.Tuple[BraxState, chex.Array, MusicPolicyOutput, Normal]:
+        (
+            state,
+            action,
+            policy_out,
+            self.policy_state,
+            predictor_out,
+            self.predictor_state,
+        ) = onestep_fn(
+            self.params,
+            prng_key,
+            state,
+            self.policy_state,
+            self.predictor_state,
+            music,
+            prev_terminal,
+        )
+        return state, action, policy_out, predictor_out
 
 
 class Learner:
@@ -465,6 +445,8 @@ class Learner:
         self,
         *,
         action_dim: int,
+        observation_dim: int,
+        n_pitches: int,
         config: Config,
         actor: Actor,
         optimizer: optax.GradientTransformation,
@@ -473,100 +455,248 @@ class Learner:
         self._actor = actor
         self._opt_state = optimizer.init(actor.params)
         self._opt_update = optimizer.update
-        fwd = lambda obs: MLPPolicy(action_dim=action_dim, config=config)(obs)  # noqa
-        _, self._pi_and_v = hk.without_apply_rng(hk.transform(fwd))
 
-    @functools.partial(jax.jit, static_argnums=0)
-    def _next_value(self, params: hk.Params, last_obs: Array) -> chex.Array:
-        _, _, next_value = jax.lax.stop_gradient(self._pi_and_v(params, last_obs))
-        return next_value
+        def next_value_fn(
+            x: t.Tuple[chex.Array, chex.Array, chex.Array],
+            state: hk.LSTMState,
+        ) -> chex.Array:
+            policy = MusicPolicy(action_dim, observation_dim, n_pitches, config)
+            return policy(x, state)[0].value
 
-    def learn(self, rollout_result, prng_seq):
-        next_value = self._next_value(self._actor.params, rollout_result.last_obs())
-        batch = _make_batch(rollout_result, next_value, self._config)
-        n_batches = batch.reward.shape[0]
+        _, next_value = hk.transform(next_value_fn)
+        self._next_value = jax.jit(next_value)
+
+        def loss_fn(
+            batch: MusicBatch,
+            policy_initial_state: t.Optional[hk.LSTMState],
+            predictor_initial_state: t.Optional[hk.LSTMState],
+        ) -> t.Tuple[chex.Array, t.Dict[str, chex.Array]]:
+            policy = MusicPolicy(action_dim, observation_dim, n_pitches, config)
+            batch_size = batch.observation.shape[1]
+            if policy_initial_state is None:
+                policy_initial_state = policy.initial_state(batch_size)
+            policy_outputs, _ = hk.dynamic_unroll(
+                policy,
+                (batch.observation, batch.music, batch.mask),
+                policy_initial_state,
+            )
+            predictor = ObsPredictor(observation_dim, config)
+            if predictor_initial_state is None:
+                predictor_initial_state = predictor.initial_state(batch_size)
+            predictor_output, _ = hk.dynamic_unroll(
+                predictor,
+                (batch.observation, batch.mask),
+                predictor_initial_state,
+            )
+
+            # Prediction losses
+            conditional_nll = -policy_outputs.pred.as_distrax().log_prob(
+                batch.next_observation
+            )
+            marginal_nll = -predictor_output.as_distrax().log_prob(
+                batch.next_observation
+            )
+            conditional_nll = jnp.sum(jnp.mean(conditional_nll, axis=1))
+            marginal_nll = jnp.sum(jnp.mean(marginal_nll, axis=1))
+
+            # Policy loss
+            policy = policy_outputs.policy.as_distrax()
+            log_prob = policy.log_prob(batch.action)
+            prob_ratio = jnp.exp(log_prob - batch.log_prob)
+
+            policy_loss = batched_ppoclip_loss(
+                prob_ratio,
+                batch.advantage,
+                self._config.clip_epsilon,
+            )
+            policy_loss = jnp.sum(policy_loss)
+
+            # Value loss
+            value = policy_outputs.value.reshape(batch.value_target.shape)
+            value_loss = jnp.sum(
+                jnp.mean(rlax.l2_loss(value, batch.value_target), axis=1)
+            )
+
+            loss = (
+                policy_loss
+                + value_loss
+                - self._config.entropy_coef * jnp.sum(policy.entropy())
+                + conditional_nll
+                + marginal_nll
+            )
+
+            metrics = {
+                "policy_loss": policy_loss,
+                "value_loss": value_loss,
+                "conditional_nll": conditional_nll,
+                "marginal_nll": marginal_nll,
+            }
+
+            return loss, metrics
+
+        _, loss = hk.transform(loss_fn)
+
+        self._loss = loss
+
+        def update(
+            params: hk.Params,
+            prng_key: chex.PRNGKey,
+            opt_state: optax.OptState,
+            batch: MusicBatch,
+            policy_initial_state: t.Optional[hk.LSTMState],
+            predictor_initial_state: t.Optional[hk.LSTMState],
+        ) -> t.Tuple[hk.Params, optax.OptState, t.Dict[str, chex.Array]]:
+            grad, metrics = jax.grad(loss, has_aux=True)(
+                params,
+                prng_key,
+                batch,
+                policy_initial_state,
+                predictor_initial_state,
+            )
+            updates, new_opt_state = self._opt_update(grad, opt_state)
+            return optax.apply_updates(params, updates), new_opt_state, metrics
+
+        self._update = jax.jit(update)
+
+    def learn(
+        self,
+        rollout: RolloutWithMusic,
+        prng_seq: hk.PRNGSequence,
+        policy_initial_states: t.Optional[hk.LSTMState],
+        predictor_initial_states: t.Optional[hk.LSTMState],
+    ) -> t.Dict[str, float]:
+        next_value = self._next_value(
+            self._actor.params,
+            next(prng_seq),
+            (rollout.last_obs(), rollout.musics[-1], 1.0 - rollout.terminals[-1]),
+            self._actor.policy_state,
+        )
+        batch = _make_music_batch(rollout, next_value, self._config)
+        metrics = collections.defaultdict(lambda: 0.0)
+
         for _ in range(self._config.n_optim_epochs):
-            indices_iter = sample_minibatch_indices(
-                n_batches,
+            for workers in sample_workers(
+                batch.value_target.shape[1],
                 self._config.n_minibatches,
                 next(prng_seq),
-            )
-            for indices in indices_iter:
-                self._actor.params, self._opt_state = self._update(
+            ):
+                self._actor.params, self._opt_state, new_metrics = self._update(
                     self._actor.params,
+                    next(prng_seq),
                     self._opt_state,
-                    batch[indices],
+                    batch[workers],
+                    select_if(policy_initial_states, workers),
+                    select_if(predictor_initial_states, workers),
                 )
-        return batch
+                for key, value in new_metrics.items():
+                    metrics[key] += value.item()
 
-    @functools.partial(jax.jit, static_argnums=0)
-    def _update(
-        self, params: hk.Params, opt_state: optax.OptState, ppo_batch
-    ) -> t.Tuple[hk.Params, optax.OptState]:
-        g = jax.grad(self._loss)(params, ppo_batch)
-        updates, new_opt_state = self._opt_update(g, opt_state)
-        return optax.apply_updates(params, updates), new_opt_state
-
-    def _loss(self, params: hk.Params, batch) -> chex.Array:
-        mu, stddev, value = self._pi_and_v(params, batch.observation)
-
-        # Policy loss
-        policy = distrax.Normal(mu, stddev)
-        log_prob = jnp.sum(policy.log_prob(batch.action), axis=-1)
-        prob_ratio = jnp.exp(log_prob - batch.log_prob)
-        policy_loss = rlax.clipped_surrogate_pg_loss(
-            prob_ratio,
-            batch.advantage,
-            self._config.clip_epsilon,
-            use_stop_gradient=False,
-        )
-
-        # Value loss
-        value_loss = jnp.mean(rlax.l2_loss(value, batch.value_target))
-
-        # Entropy regularization
-        entropy_mean = jnp.mean(jnp.sum(policy.entropy(), axis=-1))
-        return policy_loss + value_loss - self._config.entropy_coef * entropy_mean
+        return metrics
 
 
-def _to_pitches(musics: t.List[muspy.Music]) -> t.List[chex.Array]:
+class MusicIter:
+    def __init__(
+        self,
+        musics: t.List[chex.Array],
+        n_workers: int,
+        seed: int,
+    ) -> None:
+        self._musics = np.array(musics, dtype=object)
+        self._n_workers = n_workers
+        self._n_musics = len(musics)
+        self._random_state = np.random.RandomState(seed)
+        self._selected = [
+            self._random_state.choice(self._n_musics) for _ in range(n_workers)
+        ]
+        self._indices = [0] * self._n_musics
+
+    def __iter__(self) -> Self:
+        return self
+
+    def __next__(self) -> t.Tuple[chex.Array, chex.Array]:
+        ended = np.zeros(self._n_workers, dtype=bool)
+        for i in range(self._n_workers):
+            if len(self._musics[self._selected[i]]) <= self._indices[i]:
+                self._indices[i] = 0
+                self._selected[i] = self._random_state.choice(self._n_musics)
+                ended[i] = True
+        res = [self._musics[i][j] for i, j in zip(self._selected, self._indices)]
+        for i in range(self._n_workers):
+            self._indices[i] += 1
+        return jnp.concatenate(res), jnp.array(ended)
+
+
+def _to_pitches(musics: t.List[muspy.Music]) -> t.Tuple[t.List[chex.Array], int]:
     pitches = [muspy.to_pitch_representation(music) for music in musics]
     min_value = min([np.min(pitch) for pitch in pitches])
-    return [jnp.array(pitch - min_value) for pitch in pitches]
+    max_value = max([np.max(pitch) for pitch in pitches])
+    return [jnp.array(pitch - min_value) for pitch in pitches], max_value - min_value
 
 
-def load_jsb(root: str) -> t.List[chex.Array]:
+def load_jsb(root: str) -> t.Tuple[t.List[chex.Array], int]:
     jsb = muspy.JSBChoralesDataset(root, download_and_extract=True).convert()
     return _to_pitches(jsb)
 
 
-def train() -> None:
+def train(
+    log_dir: str,
+    midi_dir: str,
+    n_train_midi: int = 64,
+    n_eval_midi: int = 16,
+    n_workers: int = 16,
+    n_rollout_steps: int = 128,
+    n_training_steps: int = 1000,
+    logging_freq: int = 10,
+    eval_freq: float = 100,
+    seed: int = 0,
+) -> None:
+    # Prepare env and MusicIter
     env = create_brax_env(
         env_name="ant",
-        episode_length=1000,
+        episode_length=100000,
         action_repeat=1,
         auto_reset=True,
-        batch_size=16,
+        batch_size=n_workers,
     )
     eval_env = create_brax_env(
         env_name="ant",
-        episode_length=1000,
+        episode_length=100000,
         action_repeat=1,
         auto_reset=True,
         batch_size=1,
     )
-    prng_seq = hk.PRNGSequence(0)
+    prng_seq = hk.PRNGSequence(seed)
+    pitches, n_pitches = load_jsb(midi_dir)
+    train_music_iter = MusicIter(
+        musics=pitches[:n_train_midi],
+        n_workers=n_workers,
+        seed=seed,
+    )
+    eval_music_iter = MusicIter(
+        musics=pitches[n_train_midi : n_train_midi + n_eval_midi],
+        n_workers=1,
+        seed=seed,
+    )
+    eval_music, _ = next(eval_music_iter)
+    # Actor and training states
     state = env.reset(rng=next(prng_seq))
     config = Config()
-    actor = Actor(
-        env=env,
-        config=config,
-        net_init_key=next(prng_seq),
-        initial_state=state,
+    init, train_one_step = make_onestep_fn(env=env, n_pitches=n_pitches, config=config)
+    _, eval_one_step = make_onestep_fn(env=eval_env, n_pitches=n_pitches, config=config)
+    prev_terminal = jnp.zeros((n_workers,), dtype=bool)
+    params = init(
+        next(prng_seq),
+        state,
+        None,
+        None,
+        next(train_music_iter)[0],
+        prev_terminal,
     )
-    eval_step = jax.jit(actor.make_step_fn(eval_env)[1])
+    actor = Actor(params=params, policy_state=None, predictor_state=None)
     learner = Learner(
         action_dim=env.action_size,
+        observation_dim=env.observation_size,
+        n_pitches=n_pitches,
         config=config,
         actor=actor,
         optimizer=optax.chain(
@@ -574,37 +704,65 @@ def train() -> None:
             optax.adam(3e-4, eps=1e-4),
         ),
     )
-    rollout = RolloutResult([state.obs])
-    for i in range(1000):
-        for _ in range(256):
-            state, act, out = actor.step(next(prng_seq), state)
+    rollout = RolloutWithMusic(observations=[state.obs])
+    metrics_id = 1
+    viewer_id = 1
+    log_dir = pathlib.Path(log_dir)
+    # Training loop
+    for i in range(n_training_steps):
+        policy_initial_state = actor.policy_state
+        predictor_initial_state = actor.predictor_state
+        # Rollout
+        for _ in range(n_rollout_steps):
+            music, ended = next(train_music_iter)
+            prev_terminal = jnp.logical_or(ended, state.done)
+            state, action, policy_out, predictor_out = actor.step(
+                onestep_fn=train_one_step,
+                state=state,
+                music=music,
+                prng_key=next(prng_seq),
+                prev_terminal=prev_terminal,
+            )
             rollout.append(
                 observation=state.obs,
-                action=act,
-                reward=state.reward,
-                output=out,
-                terminal=state.done,
+                music=music,
+                action=action,
+                policy_out=policy_out,
+                predictor_out=predictor_out,
+                terminal=prev_terminal,
             )
-        batch = learner.learn(rollout, prng_seq)
-        print(f"Step {i} Avg. Reward: {jnp.mean(batch.reward)}")
-        if i % 100 == 0:
+        metrics = learner.learn(
+            rollout,
+            prng_seq,
+            policy_initial_state,
+            predictor_initial_state,
+        )
+        rollout.clear()
+        if (i + 1) % logging_freq == 0:
+            with log_dir.joinpath(f"metrics-{metrics_id}.json").open(mode="w") as f:
+                json.dump(metrics, f)
+            metrics_id += 1
+        if (i + 1) % eval_freq == 0:
             eval_state = eval_env.reset(next(prng_seq))
             qps = [jax.tree_map(lambda x: x.reshape(x.shape[1:]), eval_state.qp)]
-            while eval_state.done[0] is False:
-                eval_state, _, _ = eval_step(actor.params, next(prng_seq), eval_state)
+            eval_actor = Actor(params=params, policy_state=None, predictor_state=None)
+            for music in eval_music:
+                state, _, _, _ = eval_actor.step(
+                    onestep_fn=eval_one_step,
+                    state=eval_state,
+                    music=music.reshape((1,)),
+                    prng_key=next(prng_seq),
+                    prev_terminal=jnp.zeros((1,)),
+                )
                 qps.append(
                     jax.tree_map(lambda x: x.reshape(x.shape[1:]), eval_state.qp)
                 )
-                with open("viewer.html", "w") as f:
-                    f.write(brax_html.render(env.sys, qps))
-            if i // 100 == 1:
-                print("Open viewer.html for checking evaluated behavior!")
-        rollout.clear()
+                with log_dir.joinpath(f"viewer-{viewer_id}.html").open(mode="w") as f:
+                    f.write(brax_html.render(eval_env.sys, qps))
+                viewer_id += 1
 
 
 if __name__ == "__main__":
     import typer
 
-    app = typer.Typer()
-    app.command()(train)
-    app()
+    typer.run(train)
