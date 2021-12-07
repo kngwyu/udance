@@ -32,13 +32,6 @@ batched_ppoclip_loss = jax.vmap(
 )
 
 
-def select_if(obj: t.Optional[t.Any], idx: t.Any) -> t.Optional[t.Any]:
-    if obj is None:
-        return None
-    else:
-        return obj[idx]
-
-
 @dataclasses.dataclass(frozen=True)
 class Config:
     """Some hyper parameters required by PPO."""
@@ -574,6 +567,15 @@ class Learner:
         )
         batch = _make_music_batch(rollout, next_value, self._config)
         metrics = collections.defaultdict(lambda: 0.0)
+
+        def select_if(
+            state: t.Optional[hk.LSTMState],
+            idx: chex.Array,
+        ) -> t.Optional[hk.LSTMState]:
+            if state is None:
+                return None
+            else:
+                return jax.tree_map(lambda x: x[idx], state)
 
         for _ in range(self._config.n_optim_epochs):
             for workers in sample_workers(
