@@ -14,6 +14,7 @@ import muspy
 import numpy as np
 import optax
 import rlax
+import tqdm
 
 from brax.envs import Env, State as BraxState, create as create_brax_env
 from brax.io import html as brax_html
@@ -709,7 +710,7 @@ def train(
     viewer_id = 1
     log_dir = pathlib.Path(log_dir)
     # Training loop
-    for i in range(n_training_steps):
+    for i in tqdm.tqdm(range(n_training_steps)):
         policy_initial_state = actor.policy_state
         predictor_initial_state = actor.predictor_state
         # Rollout
