@@ -42,7 +42,7 @@ class Config:
     gae_lambda: float = 0.95
     n_optim_epochs: int = 10
     n_minibatches: int = 1
-    reward_scaling: float = 1.0
+    reward_scaling: float = 0.1
     # Network config
     hidden_dims: t.Sequence[int] = (64, 64)
     rnn_hidden_dim: int = 64
@@ -325,7 +325,11 @@ def _make_music_batch(
     policy_outputs = jax.tree_map(lambda *x: jnp.stack(x), *rollout.policy_outputs)
     conditional_logp = policy_outputs.pred.as_distrax().log_prob(observation[1:])
     raw_rewards = conditional_logp - marginal_logp
-    reward = jnp.clip(raw_rewards, a_min=config.min_r, a_max=config.max_r)
+    reward = jnp.clip(
+        raw_rewards * config.reward_scaling,
+        a_min=config.min_r,
+        a_max=config.max_r,
+    )
     # Compute advantage
     mask = 1.0 - jnp.stack(rollout.terminals)
     value = jnp.concatenate(
@@ -490,8 +494,8 @@ class Learner:
             marginal_nll = -predictor_output.as_distrax().log_prob(
                 batch.next_observation
             )
-            conditional_nll = jnp.sum(jnp.mean(conditional_nll, axis=1))
-            marginal_nll = jnp.sum(jnp.mean(marginal_nll, axis=1))
+            conditional_nll = jnp.mean(conditional_nll)
+            marginal_nll = jnp.mean(marginal_nll)
 
             # Policy loss
             policy = policy_outputs.policy.as_distrax()
@@ -503,13 +507,11 @@ class Learner:
                 batch.advantage,
                 self._config.clip_epsilon,
             )
-            policy_loss = jnp.sum(policy_loss)
+            policy_loss = jnp.mean(policy_loss)
 
             # Value loss
             value = policy_outputs.value.reshape(batch.value_target.shape)
-            value_loss = jnp.sum(
-                jnp.mean(rlax.l2_loss(value, batch.value_target), axis=1)
-            )
+            value_loss = jnp.mean(rlax.l2_loss(value, batch.value_target))
 
             loss = (
                 policy_loss
@@ -742,6 +744,8 @@ def train(
         )
         rollout.clear()
         if (i + 1) % logging_freq == 0:
+            for key in metrics:
+                metrics[key] /= config.n_optim_epochs
             with log_dir.joinpath(f"metrics-{metrics_id}.json").open(mode="w") as f:
                 json.dump(metrics, f)
             metrics_id += 1
