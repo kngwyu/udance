@@ -750,7 +750,7 @@ def train(
             qps = [jax.tree_map(lambda x: x.reshape(x.shape[1:]), eval_state.qp)]
             eval_actor = Actor(params=params, policy_state=None, predictor_state=None)
             for music in eval_music:
-                state, _, _, _ = eval_actor.step(
+                eval_state, _, _, _ = eval_actor.step(
                     onestep_fn=eval_one_step,
                     state=eval_state,
                     music=music.reshape((1,)),
