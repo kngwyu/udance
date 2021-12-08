@@ -10,6 +10,7 @@ from udance import (
     Config,
     MusicIter,
     MusicPolicy,
+    MusicRNN,
     ObsPredictor,
     RolloutWithMusic,
     _make_music_batch,
@@ -20,6 +21,11 @@ from udance import (
 )
 
 T, N, S, A, P = 5, 4, 3, 2, 6
+
+
+@pytest.fixture
+def config() -> Config:
+    return Config(rnn_hiddne_dim=12, hidden_dims=(8, 8))
 
 
 def test_gae() -> None:
@@ -42,6 +48,15 @@ def test_batched_ppo_loss() -> None:
     adv = jax.random.normal(key=jax.random.PRNGKey(44), shape=(T, N))
     policy_loss = batched_ppoclip_loss(prob_ratio, adv, 0.2)
     chex.assert_shape(policy_loss, (T,))
+
+
+def test_music_rnn() -> None:
+    config = Config()
+    init, music_rnn = hk.transform(lambda x: MusicRNN(P, config)(x))
+    pitch = jnp.ones((N,), dtype=jnp.int32)
+    mask = jnp.zeros((N,))
+    params = init(jax.random.PRNGKey(43), (pitch, mask))
+    output, _ = music_policy(params, jax.random.PRNGKey(44), (pitch, mask))
 
 
 def test_music_policy() -> None:
