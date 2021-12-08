@@ -526,6 +526,10 @@ class Learner:
                 "value_loss": value_loss,
                 "conditional_nll": conditional_nll,
                 "marginal_nll": marginal_nll,
+                "conditional-mean": jnp.mean(policy_outputs.pred.mean),
+                "conditional-stddev": jnp.mean(policy_outputs.pred.stddev),
+                "marginal-mean": jnp.mean(predictor_output.mean),
+                "marginal-stddev": jnp.mean(predictor_output.stddev),
             }
 
             return loss, metrics
@@ -646,6 +650,7 @@ def load_jsb(root: str) -> t.Tuple[t.List[chex.Array], int]:
 def train(
     log_dir: str,
     midi_dir: str,
+    env_name: str = "ant",
     n_train_midi: int = 64,
     n_eval_midi: int = 16,
     n_workers: int = 16,
@@ -657,14 +662,14 @@ def train(
 ) -> None:
     # Prepare env and MusicIter
     env = create_brax_env(
-        env_name="ant",
+        env_name=env_name,
         episode_length=100000,
         action_repeat=1,
         auto_reset=True,
         batch_size=n_workers,
     )
     eval_env = create_brax_env(
-        env_name="ant",
+        env_name=env_name,
         episode_length=100000,
         action_repeat=1,
         auto_reset=True,
