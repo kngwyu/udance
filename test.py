@@ -74,7 +74,7 @@ def test_music_policy_unroll() -> None:
     output = music_policy(params, jax.random.PRNGKey(44), obs, pitch, mask)
     chex.assert_shape((output.policy.mean, output.policy.stddev), (T, N, A))
     chex.assert_shape((output.pred.mean, output.pred.stddev), (T, N, S))
-    chex.assert_shape(output.value, (T, N))
+    chex.assert_shape(output.value, (T, N, 1))
 
 
 def test_obs_predictor() -> None:
@@ -92,8 +92,8 @@ def test_music_batch() -> None:
     init_mp, music_policy = hk.transform(
         lambda x, state: MusicPolicy(A, S, P, config)(x, state)
     )
-    init_op, obs_predictor = hk.without_apply_rng(
-        hk.transform(lambda x, state: ObsPredictor(S, config)(x, state))
+    init_op, obs_predictor = hk.transform(
+        lambda x, state: ObsPredictor(S, config)(x, state)
     )
     obs = jnp.ones((N, S))
     pitch = jnp.ones((N,), dtype=jnp.int32)
@@ -111,6 +111,7 @@ def test_music_batch() -> None:
         )
         predictor_out, predictor_hidden = obs_predictor(
             params_o,
+            jax.random.PRNGKey(90 + i),
             (obs, mask),
             predictor_hidden,
         )
@@ -123,7 +124,7 @@ def test_music_batch() -> None:
             terminal=jnp.zeros((N,), dtype=bool),
         )
 
-    batch = _make_music_batch(rollout, jnp.ones((N,)), config)
+    batch, _, _ = _make_music_batch(rollout, jnp.ones((N,)), config)
     chex.assert_shape(batch.observation, (T, N, S))
     chex.assert_shape(batch.action, (T, N, A))
     chex.assert_shape(

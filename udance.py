@@ -41,7 +41,7 @@ class Config:
     gamma: float = 0.99
     gae_lambda: float = 0.95
     n_optim_epochs: int = 10
-    n_minibatches: int = 1
+    n_minibatches: int = 4
     reward_scaling: float = 0.1
     # Network config
     hidden_dims: t.Sequence[int] = (64, 64)
@@ -187,6 +187,7 @@ class ObsPredictor(hk.RNNCore):
             activate_final=True,
         )
         self._pred = LogstdNormal(obs_dim, w_init=hk.initializers.Orthogonal(scale=1.0))
+        self._drop_prob = config.drop_prob
 
     def initial_state(self, batch_size: t.Optional[int]) -> hk.LSTMState:
         return self._lstm.initial_state(batch_size)
@@ -204,7 +205,8 @@ class ObsPredictor(hk.RNNCore):
             obs_encoded,
             jax.tree_map(lambda x: x * rnn_mask.reshape(-1, 1), prev_state),
         )
-        pred = self._pred(self._mlp(post_rnn))
+        post_rnn_dropped = hk.dropout(hk.next_rng_key(), self._drop_prob, post_rnn)
+        pred = self._pred(self._mlp(post_rnn_dropped))
         return pred, next_state
 
 
@@ -316,7 +318,7 @@ def _make_music_batch(
     rollout: RolloutWithMusic,
     next_value: chex.Array,
     config: Config,
-) -> MusicBatch:
+) -> t.Tuple[MusicBatch, chex.Array, chex.Array]:
     # Observation
     observation = jnp.stack(rollout.observations)  # T, N, obs-dim
     # Compute rewards
@@ -341,7 +343,7 @@ def _make_music_batch(
     # Log π
     action = jnp.stack(rollout.actions)
     log_prob = policy_outputs.policy.as_distrax().log_prob(action)
-    return MusicBatch(
+    batch = MusicBatch(
         observation=observation[:-1],
         next_observation=observation[1:],
         music=jnp.stack(rollout.musics),
@@ -351,6 +353,7 @@ def _make_music_batch(
         log_prob=log_prob,
         mask=mask,
     )
+    return batch, reward, raw_rewards
 
 
 def make_onestep_fn(
@@ -599,7 +602,8 @@ class Learner:
                 )
                 for key, value in new_metrics.items():
                     metrics[key] += value.item()
-
+        for key in metrics:
+            metrics[key] /= config.n_optim_epochs
         return metrics
 
 
@@ -749,8 +753,6 @@ def train(
         )
         rollout.clear()
         if (i + 1) % logging_freq == 0:
-            for key in metrics:
-                metrics[key] /= config.n_optim_epochs
             with log_dir.joinpath(f"metrics-{metrics_id}.json").open(mode="w") as f:
                 json.dump(metrics, f)
             metrics_id += 1
