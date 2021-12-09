@@ -45,7 +45,7 @@ class Config:
     reward_scaling: float = 0.1
     # Network config
     hidden_dims: t.Sequence[int] = (64, 64)
-    rnn_hidden_dim: int = 64
+    rnn_hidden_dims: t.Tuple[int, int] = (64, 32)
     drop_prob: float = 0.5
     # Unsupervised learning
     min_r: float = -1.0
@@ -107,19 +107,19 @@ MusicRNNState = t.Tuple[hk.LSTMState, hk.LSTMState]
 
 
 class MusicRNN(hk.RNNCore):
-    """π(Xt+1|Xt, Yt, Xt-1, ...) & P(Xt+1|Xt, Yt Xt-1, ...)"""
+    """Encode a sequence of music to a latent vector z"""
 
     def __init__(self, n_pitches: int, config: Config) -> None:
         super().__init__(name="music_rnn")
+        self._drop_prob = config.drop_prob
         self._encoder = hk.Embed(
             vocab_size=n_pitches,
             embed_dim=config.rnn_hidden_dim,
             w_init=orthogonal(np.sqrt(2.0)),
         )
-        self._lstm1 = hk.LSTM(config.rnn_hidden_dim)
-        self._lstm2 = hk.LSTM(config.rnn_hidden_dim)
+        self._lstm1 = hk.LSTM(config.rnn_hidden_dims[0])
+        self._lstm2 = hk.LSTM(config.rnn_hidden_dims[1])
         self._decoder = hk.Linear(vocab_size, w_init=orthogonal(1.0))
-        self._drop_prob = config.drop_prob
 
     def initial_state(self, batch_size: t.Optional[int]) -> MusicRNNState:
         state1 = self._lstm1.initial_state(batch_size)
@@ -132,21 +132,22 @@ class MusicRNN(hk.RNNCore):
         prev_state: MusicRNNState,
     ) -> t.Tuple[chex.Array, MusicRNNState]:
         x, mask = inputs
-        state1, state2 = prev_state
+        state1, state2 = jax.tree_map(
+            lambda x: x * mask.reshape(-1, 1),
+            (state1, state2),
+        )
         x = self._encoder(x)
         x = hk.dropout(hk.next_rng_key(), self._drop_prob, x)
-        x, next_state1 = self._lstm1(
-            x,
-            jax.tree_map(lambda x: x * rnn_mask.reshape(-1, 1), state1),
-        )
+        x, next_state1 = self._lstm1(x, state1)
         x = hk.dropout(hk.next_rng_key(), self._drop_prob, x)
-        latent, next_state2 = self._lstm2(
-            x,
-            jax.tree_map(lambda x: x * rnn_mask.reshape(-1, 1), state2),
-        )
-        x = hk.dropout(hk.next_rng_key(), self._drop_prob, latent)
-        logits = self._decoder(x)
-        return MusicRNNOutput(latent, logits), (state1, state2)
+        latent, next_state2 = self._lstm2(x, state2)
+        logits = self._decoder(latent)
+        return MusicRNNOutput(latent=latent, logits=logits), (state1, state2)
+
+
+class Output(t.NamedTuple):
+    policy: Normal
+    value: chex.Array
 
 
 class Policy(hk.Module):
@@ -162,68 +163,35 @@ class Policy(hk.Module):
         )
         self._value = mlp(config.hidden_dims, 1, 1.0)
 
-    def __call__(
-        self,
-        inputs: t.Tuple[chex.Array, chex.Array, chex.Array],
-        prev_state: t.Optional[hk.LSTMState] = None,
-    ) -> t.Tuple[MusicPolicyOutput, hk.LSTMState]:
-        obs, music, rnn_mask = inputs
-        if prev_state is None:
-            prev_state = self.initial_state(obs.shape[0])
-        obs_encoded = self._obs_encoder(obs)
-        music_encoded = self._music_encoder(music)
-        music_encoded_dropped = hk.dropout(
-            hk.next_rng_key(),
-            self._drop_prob,
-            music_encoded,
-        )
-        post_rnn, next_state = self._lstm(
-            jnp.concatenate((obs_encoded, music_encoded_dropped), axis=1),
-            jax.tree_map(lambda x: x * rnn_mask.reshape(-1, 1), prev_state),
-        )
-        post_rnn_dropped = hk.dropout(hk.next_rng_key(), self._drop_prob, post_rnn)
-        pi_mean = self._pi_mean(post_rnn_dropped)
+    def __call__(self, obs: chex.Array, music_latent: chex.Array) -> Normal:
+        x = jnp.concatenate((obs, music_latent), axis=1)
+        pi_mean = self._pi_mean(x)
         pi_std = jnp.ones_like(pi_mean) * jnp.exp(self._logstd_param)
-        value = self._value(post_rnn_dropped)
-        pred = self._pred(self._pre_pred(post_rnn_dropped))
-        return MusicPolicyOutput(Normal(pi_mean, pi_std), value, pred), next_state
+        policy = Normal(pi_mean, pi_std)
+        value = self._value(x)
+        return Output(policy, value, prediction)
 
 
-class ObsPredictor(hk.RNNCore):
-    """P(Xt+1|Xt, Xt-1, ...)"""
+class Predictor(hk.Module):
+    """Predict next state with Gaussian"""
 
-    def __init__(self, obs_dim: int, config: Config) -> None:
-        super().__init__(name="obs_predictor")
-        self._obs_encoder = hk.Linear(config.rnn_hidden_dim, w_init=orthogonal(1.0))
-        self._lstm = hk.LSTM(config.rnn_hidden_dim)
-        self._mlp = hk.nets.MLP(
-            config.hidden_dims,
-            w_init=orthogonal(),
-            activation=jax.nn.tanh,
-            activate_final=True,
-        )
-        self._pred = LogstdNormal(obs_dim, w_init=hk.initializers.Orthogonal(scale=1.0))
-        self._drop_prob = config.drop_prob
+    def __init__(self, observation_dim: int, config: Config) -> None:
+        super().__init__(name="prediction")
+        prediction = [
+            hk.nets.MLP(
+                config.hidden_dims,
+                w_init=orthogonal(),
+                activation=jax.nn.tanh,
+                activate_final=True,
+            ),
+            LogstdNormal(observation_dim, w_init=orthogonal(1.0)),
+        ]
+        self._prediction = hk.Sequential(prediction)
 
-    def initial_state(self, batch_size: t.Optional[int]) -> hk.LSTMState:
-        return self._lstm.initial_state(batch_size)
-
-    def __call__(
-        self,
-        inputs: t.Tuple[chex.Array, chex.Array, chex.Array],
-        prev_state: t.Optional[hk.LSTMState] = None,
-    ) -> t.Tuple[Normal, hk.LSTMState]:
-        obs, rnn_mask = inputs
-        if prev_state is None:
-            prev_state = self.initial_state(obs.shape[0])
-        obs_encoded = self._obs_encoder(obs)
-        post_rnn, next_state = self._lstm(
-            obs_encoded,
-            jax.tree_map(lambda x: x * rnn_mask.reshape(-1, 1), prev_state),
-        )
-        post_rnn_dropped = hk.dropout(hk.next_rng_key(), self._drop_prob, post_rnn)
-        pred = self._pred(self._mlp(post_rnn_dropped))
-        return pred, next_state
+    def __call__(self, obs: chex.Array, music_latent: chex.Array) -> Normal:
+        x = jnp.concatenate((obs, music_latent), axis=1)
+        prediction = self._prediction(x)
+        return prediction
 
 
 def sample_workers(
@@ -266,15 +234,15 @@ batched_gae = jax.vmap(_gae_impl, in_axes=(1, 1, None, 1), out_axes=1)
 
 
 @chex.dataclass
-class RolloutWithMusic:
+class Rollout:
     """A container class that holds the result of N-step rollout"""
 
     observations: t.List[chex.Array]
     musics: t.List[chex.Array] = dataclasses.field(default_factory=list)
     actions: t.List[chex.Array] = dataclasses.field(default_factory=list)
     terminals: t.List[chex.Array] = dataclasses.field(default_factory=list)
-    policy_outputs: t.List[MusicPolicyOutput] = dataclasses.field(default_factory=list)
-    predictor_outputs: t.List[Normal] = dataclasses.field(default_factory=list)
+    outputs: t.List[Output] = dataclasses.field(default_factory=list)
+    music_latents: t.List[chex.Array] = dataclasses.field(default_factory=list)
 
     def append(
         self,
@@ -282,16 +250,16 @@ class RolloutWithMusic:
         observation: chex.Array,
         music: chex.Array,
         action: chex.Array,
-        policy_out: MusicPolicyOutput,
-        predictor_out: Normal,
         terminal: chex.Array,
+        output: chex.Array,
+        music_latent: chex.Array,
     ) -> None:
         self.observations.append(observation)
         self.musics.append(music)
         self.actions.append(action)
-        self.policy_outputs.append(policy_out)
-        self.predictor_outputs.append(predictor_out)
         self.terminals.append(terminal)
+        self.outputs.append(output)
+        self.music_latents.append(music_latent)
 
     def last_obs(self) -> chex.Array:
         assert len(self.observations) == len(self.actions) + 1
@@ -301,8 +269,7 @@ class RolloutWithMusic:
         self.observations = [self.last_obs()]
         self.musics.clear()
         self.actions.clear()
-        self.policy_outputs.clear()
-        self.predictor_outputs.clear()
+        self.outputs.clear()
         self.terminals.clear()
 
 
@@ -331,7 +298,7 @@ class MusicBatch(t.NamedTuple):
 
 @functools.partial(jax.jit, static_argnums=2)
 def _make_music_batch(
-    rollout: RolloutWithMusic,
+    rollout: Rollout,
     next_value: chex.Array,
     config: Config,
 ) -> t.Tuple[MusicBatch, chex.Array, chex.Array]:
@@ -370,6 +337,14 @@ def _make_music_batch(
         mask=mask,
     )
     return batch, reward, raw_rewards
+
+
+def make_rewardgen_fn(observation_dim: int, config: Config) -> None:
+    def gen_rewards(observations: chex.Array, music_latents: chex.Array) -> None:
+        chex.assert_rank((observations, music_latents), 3)  # T, N, O/H
+        predictor = Predictor(observation_dim, config)
+
+    return gen_rewards
 
 
 def make_onestep_fn(
@@ -579,7 +554,7 @@ class Learner:
 
     def learn(
         self,
-        rollout: RolloutWithMusic,
+        rollout: Rollout,
         prng_seq: hk.PRNGSequence,
         policy_initial_states: t.Optional[hk.LSTMState],
         predictor_initial_states: t.Optional[hk.LSTMState],
@@ -734,7 +709,7 @@ def train(
             optax.adam(3e-4, eps=1e-4),
         ),
     )
-    rollout = RolloutWithMusic(observations=[state.obs])
+    rollout = Rollout(observations=[state.obs])
     metrics_id = 1
     viewer_id = 1
     log_dir = pathlib.Path(log_dir)

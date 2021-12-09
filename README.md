@@ -5,16 +5,21 @@ A tiny coursework project.
 [Brax](https://github.com/google/brax) ants are trained via maximizing information transfer from
 [Bach Chorales Data Set](https://archive.ics.uci.edu/ml/datasets/Bach+Chorales).
 
-## Test
-
-```
-python -m pytest test.py
-```
 
 ## Run
 
+Due to the time constraint, implementation is done in a single file `udance.py`.
+
 ```
 python udance.py train
+```
+
+## Test
+
+Requires [pytest](https://docs.pytest.org/en/6.2.x/example/parametrize.html)
+
+```
+python -m pytest test.py
 ```
 
 ## Requirements

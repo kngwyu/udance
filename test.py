@@ -28,7 +28,7 @@ def config() -> Config:
     return Config(rnn_hiddne_dim=12, hidden_dims=(8, 8))
 
 
-def test_gae() -> None:
+def test_gae(config: Config) -> None:
     rewards = jax.random.normal(key=jax.random.PRNGKey(43), shape=(T, N))
     values = jax.random.normal(key=jax.random.PRNGKey(44), shape=(T + 1, N))
     discount = jnp.ones_like(rewards) * 0.999
@@ -43,15 +43,14 @@ def test_gae() -> None:
     chex.assert_trees_all_close(our_result, their_result)
 
 
-def test_batched_ppo_loss() -> None:
+def test_batched_ppo_loss(config: Config) -> None:
     prob_ratio = jax.random.normal(key=jax.random.PRNGKey(43), shape=(T, N))
     adv = jax.random.normal(key=jax.random.PRNGKey(44), shape=(T, N))
     policy_loss = batched_ppoclip_loss(prob_ratio, adv, 0.2)
     chex.assert_shape(policy_loss, (T,))
 
 
-def test_music_rnn() -> None:
-    config = Config()
+def test_music_rnn(config: Config) -> None:
     init, music_rnn = hk.transform(lambda x: MusicRNN(P, config)(x))
     pitch = jnp.ones((N,), dtype=jnp.int32)
     mask = jnp.zeros((N,))
@@ -59,8 +58,7 @@ def test_music_rnn() -> None:
     output, _ = music_policy(params, jax.random.PRNGKey(44), (pitch, mask))
 
 
-def test_music_policy() -> None:
-    config = Config()
+def test_music_policy(config: Config) -> None:
     init, music_policy = hk.transform(lambda x: MusicPolicy(A, S, P, config)(x))
     obs = jnp.ones((N, S))
     pitch = jnp.ones((N,), dtype=jnp.int32)
@@ -70,36 +68,6 @@ def test_music_policy() -> None:
     chex.assert_shape((output.policy.mean, output.policy.stddev), (N, A))
     chex.assert_shape((output.pred.mean, output.pred.stddev), (N, S))
     chex.assert_shape(output.value, (N, 1))
-
-
-def test_music_policy_unroll() -> None:
-    config = Config()
-
-    def forward(obs, pitch, mask):
-        policy = MusicPolicy(A, S, P, config)
-        initial_state = policy.initial_state(N)
-        out, _ = hk.dynamic_unroll(policy, (obs, pitch, mask), initial_state)
-        return out
-
-    init, music_policy = hk.transform(forward)
-    obs = jnp.ones((T, N, S))
-    pitch = jnp.ones((T, N), dtype=jnp.int32)
-    mask = jnp.zeros((T, N))
-    params = init(jax.random.PRNGKey(43), obs, pitch, mask)
-    output = music_policy(params, jax.random.PRNGKey(44), obs, pitch, mask)
-    chex.assert_shape((output.policy.mean, output.policy.stddev), (T, N, A))
-    chex.assert_shape((output.pred.mean, output.pred.stddev), (T, N, S))
-    chex.assert_shape(output.value, (T, N, 1))
-
-
-def test_obs_predictor() -> None:
-    config = Config()
-    init, obs_predictor = hk.transform(lambda x: ObsPredictor(S, config)(x))
-    obs = jnp.ones((N, S))
-    mask = jnp.zeros((N, 1))
-    params = init(jax.random.PRNGKey(43), (obs, mask))
-    output, state = obs_predictor(params, jax.random.PRNGKey(44), (obs, mask))
-    chex.assert_shape((output.mean, output.stddev), (N, S))
 
 
 def test_music_batch() -> None:
