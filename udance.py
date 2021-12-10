@@ -45,8 +45,8 @@ class Config:
     reward_scaling: float = 0.1
     # Network config
     hidden_dims: t.Sequence[int] = (64, 64)
-    rnn_hidden_dims: t.Tuple[int, int] = (64, 32)
-    drop_prob: float = 0.5
+    rnn_hidden_dims: t.Sequence[int] = (128, 64)
+    music_latent_dim: int = 16
     # Unsupervised learning
     min_r: float = -1.0
     max_r: float = 1.0
@@ -80,6 +80,10 @@ class Normal(t.NamedTuple):
     def as_distrax(self) -> distrax.MultivariateNormalDiag:
         return distrax.MultivariateNormalDiag(loc=self.mean, scale_diag=self.stddev)
 
+    def sample(self) -> chex.Array:
+        """Only callable from hk.transform"""
+        return self.as_distrax().sample(seed=hk.next_rng_key())
+
 
 class LogstdNormal(hk.Module):
     def __init__(
@@ -98,54 +102,79 @@ class LogstdNormal(hk.Module):
         return Normal(mean=mean, stddev=jnp.exp(logstd * 0.5))
 
 
-class MusicRNNOutput(t.NamedTuple):
+class MusicLatent(t.NamedTuple):
+    dist: Normal
     latent: chex.Array
-    logits: chex.Array
 
 
 MusicRNNState = t.Tuple[hk.LSTMState, hk.LSTMState]
 
 
-class MusicRNN(hk.RNNCore):
+class MusicEncoder(hk.RNNCore):
     """Encode a sequence of music to a latent vector z"""
 
     def __init__(self, n_pitches: int, config: Config) -> None:
-        super().__init__(name="music_rnn")
-        self._drop_prob = config.drop_prob
+        super().__init__(name="music_encoder")
         self._encoder = hk.Embed(
             vocab_size=n_pitches,
-            embed_dim=config.rnn_hidden_dim,
+            embed_dim=config.rnn_hidden_dims[0],
             w_init=orthogonal(np.sqrt(2.0)),
         )
         self._lstm1 = hk.LSTM(config.rnn_hidden_dims[0])
         self._lstm2 = hk.LSTM(config.rnn_hidden_dims[1])
-        self._decoder = hk.Linear(vocab_size, w_init=orthogonal(1.0))
+        self._latent = LogstdNormal(
+            output_dim=config.music_latent_dim,
+            w_init=orthogonal(1.0),
+        )
 
     def initial_state(self, batch_size: t.Optional[int]) -> MusicRNNState:
-        state1 = self._lstm1.initial_state(batch_size)
-        state2 = self._lstm2.initial_state(batch_size)
-        return state1, state2
+        s1 = self._lstm1.initial_state(batch_size)
+        s2 = self._lstm2.initial_state(batch_size)
+        return s1, s2
 
     def __call__(
         self,
         inputs: t.Tuple[chex.Array, chex.Array],
         prev_state: MusicRNNState,
-    ) -> t.Tuple[chex.Array, MusicRNNState]:
+    ) -> t.Tuple[MusicLatent, MusicRNNState]:
         x, mask = inputs
-        state1, state2 = jax.tree_map(
-            lambda x: x * mask.reshape(-1, 1),
-            (state1, state2),
-        )
+        state1, state2 = jax.tree_map(lambda x: x * mask.reshape(-1, 1), prev_state)
         x = self._encoder(x)
-        x = hk.dropout(hk.next_rng_key(), self._drop_prob, x)
+        x = jax.nn.relu(x)
         x, next_state1 = self._lstm1(x, state1)
-        x = hk.dropout(hk.next_rng_key(), self._drop_prob, x)
-        latent, next_state2 = self._lstm2(x, state2)
-        logits = self._decoder(latent)
-        return MusicRNNOutput(latent=latent, logits=logits), (state1, state2)
+        x = jax.nn.relu(x)
+        x, next_state2 = self._lstm2(x, state2)
+        dist = self._latent(x)
+        return MusicLatent(dist, dist.sample()), (next_state1, next_state2)
 
 
-class Output(t.NamedTuple):
+class MusicDecoder(hk.RNNCore):
+    def __init__(self, n_pitches: int, config: Config) -> None:
+        super().__init__(name="music_decoder")
+        self._lstm1 = hk.LSTM(config.rnn_hidden_dims[1])
+        self._lstm2 = hk.LSTM(config.rnn_hidden_dims[0])
+        self._decoder = hk.Linear(n_pitches, w_init=orthogonal(1.0))
+
+    def initial_state(self, batch_size: t.Optional[int]) -> MusicRNNState:
+        s1 = self._lstm1.initial_state(batch_size)
+        s2 = self._lstm2.initial_state(batch_size)
+        return s1, s2
+
+    def __call__(
+        self,
+        inputs: t.Tuple[chex.Array, chex.Array],
+        prev_state: MusicRNNState,
+    ) -> t.Tuple[MusicLatent, MusicRNNState]:
+        latent, mask = inputs
+        state1, state2 = jax.tree_map(lambda x: x * mask.reshape(-1, 1), prev_state)
+        x, next_state1 = self._lstm1(latent, state1)
+        x = jax.nn.relu(x)
+        x, next_state2 = self._lstm2(x, state2)
+        logit = self._decoder(x)
+        return logit, (next_state1, next_state2)
+
+
+class PolicyOutput(t.NamedTuple):
     policy: Normal
     value: chex.Array
 
@@ -163,13 +192,13 @@ class Policy(hk.Module):
         )
         self._value = mlp(config.hidden_dims, 1, 1.0)
 
-    def __call__(self, obs: chex.Array, music_latent: chex.Array) -> Normal:
-        x = jnp.concatenate((obs, music_latent), axis=1)
+    def __call__(self, obs: chex.Array, music_latent: chex.Array) -> PolicyOutput:
+        x = jnp.concatenate((obs, music_latent), axis=-1)
         pi_mean = self._pi_mean(x)
-        pi_std = jnp.ones_like(pi_mean) * jnp.exp(self._logstd_param)
+        pi_std = jnp.ones_like(pi_mean) * jnp.exp(self._pi_logstd)
         policy = Normal(pi_mean, pi_std)
         value = self._value(x)
-        return Output(policy, value, prediction)
+        return PolicyOutput(policy, value)
 
 
 class Predictor(hk.Module):
@@ -189,9 +218,8 @@ class Predictor(hk.Module):
         self._prediction = hk.Sequential(prediction)
 
     def __call__(self, obs: chex.Array, music_latent: chex.Array) -> Normal:
-        x = jnp.concatenate((obs, music_latent), axis=1)
-        prediction = self._prediction(x)
-        return prediction
+        x = jnp.concatenate((obs, music_latent), axis=-1)
+        return self._prediction(x)
 
 
 def sample_workers(
@@ -241,7 +269,7 @@ class Rollout:
     musics: t.List[chex.Array] = dataclasses.field(default_factory=list)
     actions: t.List[chex.Array] = dataclasses.field(default_factory=list)
     terminals: t.List[chex.Array] = dataclasses.field(default_factory=list)
-    outputs: t.List[Output] = dataclasses.field(default_factory=list)
+    outputs: t.List[PolicyOutput] = dataclasses.field(default_factory=list)
     music_latents: t.List[chex.Array] = dataclasses.field(default_factory=list)
 
     def append(
@@ -273,7 +301,7 @@ class Rollout:
         self.terminals.clear()
 
 
-class MusicBatch(t.NamedTuple):
+class Batch(t.NamedTuple):
     observation: chex.Array
     next_observation: chex.Array
     music: chex.Array
@@ -296,37 +324,28 @@ class MusicBatch(t.NamedTuple):
         )
 
 
-@functools.partial(jax.jit, static_argnums=2)
-def _make_music_batch(
+def _make_batch(
     rollout: Rollout,
     next_value: chex.Array,
+    rewardgen_fn: t.Callable[[chex.Array, chex.Array], chex.Array],
     config: Config,
-) -> t.Tuple[MusicBatch, chex.Array, chex.Array]:
-    # Observation
+) -> t.Tuple[Batch, chex.Array, chex.Array]:
+    # Observation, music_latents
     observation = jnp.stack(rollout.observations)  # T, N, obs-dim
     # Compute rewards
-    predictor = jax.tree_map(lambda *x: jnp.stack(x), *rollout.predictor_outputs)
-    marginal_logp = predictor.as_distrax().log_prob(observation[1:])
-    policy_outputs = jax.tree_map(lambda *x: jnp.stack(x), *rollout.policy_outputs)
-    conditional_logp = policy_outputs.pred.as_distrax().log_prob(observation[1:])
-    raw_rewards = conditional_logp - marginal_logp
-    reward = jnp.clip(
-        raw_rewards * config.reward_scaling,
-        a_min=config.min_r,
-        a_max=config.max_r,
-    )
+    raw_reward = rewardgen_fn(observation, jnp.stack(rollout.music_latents))
+    reward = jnp.clip(raw_reward, a_min=-1.0, a_max=1.0)
     # Compute advantage
     mask = 1.0 - jnp.stack(rollout.terminals)
-    value = jnp.concatenate(
-        (policy_outputs.value.reshape(reward.shape), next_value.reshape(1, -1)),
-        axis=0,
-    )
-    advantage = batched_gae(reward, mask * config.gamma, config.gae_lambda, value)
-    value_target = advantage + value[:-1]
+    policy_outputs = jax.tree_map(lambda *x: jnp.stack(x), *rollout.outputs)
+    value_t = policy_outputs.value.reshape(reward.shape)
+    value_t1 = jnp.concatenate((value_t, next_value.reshape(1, -1)), axis=0)
+    advantage = batched_gae(reward, mask * config.gamma, config.gae_lambda, value_t1)
+    value_target = advantage + value_t
     # Log π
     action = jnp.stack(rollout.actions)
     log_prob = policy_outputs.policy.as_distrax().log_prob(action)
-    batch = MusicBatch(
+    batch = Batch(
         observation=observation[:-1],
         next_observation=observation[1:],
         music=jnp.stack(rollout.musics),
@@ -336,15 +355,34 @@ def _make_music_batch(
         log_prob=log_prob,
         mask=mask,
     )
-    return batch, reward, raw_rewards
+    return batch, reward, raw_reward
 
 
-def make_rewardgen_fn(observation_dim: int, config: Config) -> None:
-    def gen_rewards(observations: chex.Array, music_latents: chex.Array) -> None:
-        chex.assert_rank((observations, music_latents), 3)  # T, N, O/H
+def make_rewardgen_fn(observation_dim: int, config: Config) -> hk.Transformed:
+    def gen_rewards(observation: chex.Array, music_latent: chex.Array) -> chex.Array:
+        """log q(x'|x, z) - Σz' log q(x'|x, z')"""
+        chex.assert_rank((observation, music_latent), 3)  # T + 1, N, O/H
+        n_steps, n_workers, _ = music_latent.shape
         predictor = Predictor(observation_dim, config)
+        # First, compute Σz' log q(x'|x, z')
+        obs_expanded = jnp.repeat(observation[:-1], n_workers, 1)
+        music_expanded = jnp.tile(music_latent, (1, n_workers, 1))
+        dist_expanded = predictor(obs_expanded, music_expanded)
+        obs_next_expanded = jnp.repeat(observation[1:], n_workers, 1)
+        logq_expanded = dist_expanded.as_distrax().log_prob(obs_next_expanded)
+        logq_sum = jnp.sum(logq_expanded.reshape(n_steps, n_workers, n_workers), axis=2)
+        # Then compute log q(x'|x,z)
+        dist = predictor(observation[:-1], music_latent)
+        logq = dist.as_distrax().log_prob(observation[1:])
+        return logq - logq_sum + jnp.log(n_workers)
 
-    return gen_rewards
+    return hk.without_apply_rng(hk.transform(gen_rewards))
+
+
+StepFn = t.Callable[
+    [BraxState, chex.Array, t.Optional[MusicRNNState], chex.Array],
+    t.Tuple[BraxState, chex.Array, PolicyOutput, chex.Array, MusicRNNState],
+]
 
 
 def make_onestep_fn(
@@ -354,82 +392,138 @@ def make_onestep_fn(
 ) -> hk.Transformed:
     def step_impl(
         state: BraxState,
-        policy_state: t.Optional[hk.LSTMState],
-        predictor_state: t.Optional[hk.LSTMState],
         music: chex.Array,
+        rnn_state: t.Optional[MusicRNNState],
         prev_terminal: chex.Array,
-    ) -> t.Tuple[
-        BraxState,
-        chex.Array,
-        MusicPolicyOutput,
-        hk.LSTMState,
-        Normal,
-        hk.LSTMState,
-    ]:
+    ) -> t.Tuple[BraxState, chex.Array, PolicyOutput, chex.Array, MusicRNNState]:
+        # 1. Encode music
         mask = 1.0 - prev_terminal
-        obs_predictor = ObsPredictor(obs_dim=env.observation_size, config=Config)
-        predictor_out, predictor_state = obs_predictor(
-            (state.obs, mask),
-            predictor_state,
-        )
-        music_policy = MusicPolicy(
-            action_dim=env.action_size,
-            obs_dim=env.observation_size,
-            n_pitches=n_pitches,
-            config=Config,
-        )
-        policy_out, policy_state = music_policy(
-            (state.obs, music, mask),
-            policy_state,
-        )
+        music_encoder = MusicEncoder(n_pitches=n_pitches, config=config)
+        if rnn_state is None:
+            rnn_state = music_encoder.initial_state(music.shape[0])
+        music_latent, next_rnn_state = music_encoder((music, mask), rnn_state)
+        # 2. Get policy and value
+        policy = Policy(action_dim=env.action_size, config=config)
+        policy_out = policy(state.obs, music_latent.latent)
         action = policy_out.policy.as_distrax().sample(seed=hk.next_rng_key())
         resetted_state = env.reset(hk.next_rng_key())
-        state = jax.tree_map(
-            lambda old, new: jnp.where(
-                prev_terminal.reshape((old.shape[0],) + (1,) * (old.ndim - 1)),
-                new,
-                old,
-            ),
-            state,
-            resetted_state,
-        )
+        # 3. Call env.step and get the next state
+
+        def reset_if(old: chex.Array, new: chex.Array) -> chex.Array:
+            terminal = prev_terminal.reshape((old.shape[0],) + (1,) * (old.ndim - 1))
+            return jnp.where(terminal, new, old)
+
+        state = jax.tree_map(reset_if, state, resetted_state)
         state = env.step(state, jnp.tanh(action))
-        return state, action, policy_out, policy_state, predictor_out, predictor_state
+        return state, action, policy_out, music_latent.latent, next_rnn_state
 
     return jax.tree_map(jax.jit, hk.transform(step_impl))
 
 
 @chex.dataclass
 class Actor:
+    """Actor holds network parameters and rnn states"""
+
     params: hk.Params
-    policy_state: t.Optional[hk.LSTMState]
-    predictor_state: t.Optional[hk.LSTMState]
+    rnn_state: MusicRNNState
+    step_fn: StepFn
 
     def step(
         self,
-        onestep_fn: t.Callable[..., t.Any],
+        prng_key: chex.PRNGKey,
         state: BraxState,
         music: chex.Array,
-        prng_key: chex.PRNGKey,
         prev_terminal: chex.Array,
-    ) -> t.Tuple[BraxState, chex.Array, MusicPolicyOutput, Normal]:
-        (
-            state,
-            action,
-            policy_out,
-            self.policy_state,
-            predictor_out,
-            self.predictor_state,
-        ) = onestep_fn(
+    ) -> t.Tuple[BraxState, chex.Array, PolicyOutput, chex.Array]:
+        state, action, policy_out, music_latent, self.rnn_state = self.step_fn(
             self.params,
             prng_key,
             state,
-            self.policy_state,
-            self.predictor_state,
             music,
+            self.rnn_state,
             prev_terminal,
         )
-        return state, action, policy_out, predictor_out
+        return state, action, policy_out, music_latent
+
+
+def make_loss_fn(action_dim: int, observation_dim: int, config: Config) -> None:
+    def loss_fn(
+        batch: Batch,
+        policy_initial_state: t.Optional[hk.LSTMState],
+        predictor_initial_state: t.Optional[hk.LSTMState],
+    ) -> t.Tuple[chex.Array, t.Dict[str, chex.Array]]:
+        # 1. Encode music
+        mask = 1.0 - prev_terminal
+        music_encoder = MusicEncoder(n_pitches=n_pitches, config=config)
+        if rnn_state is None:
+            rnn_state = music_encoder.initial_state(music.shape[0])
+        music_latent, next_rnn_state = music_encoder((music, mask), rnn_state)
+        # 2. Decode music and compute loss
+        music_decoder = Music
+
+        # 2. Compute  Policy
+        policy = MusicPolicy(action_dim, observation_dim, n_pitches, config)
+        batch_size = batch.observation.shape[1]
+        if policy_initial_state is None:
+            policy_initial_state = policy.initial_state(batch_size)
+        policy_outputs, _ = hk.dynamic_unroll(
+            policy,
+            (batch.observation, batch.music, batch.mask),
+            policy_initial_state,
+        )
+        predictor = ObsPredictor(observation_dim, config)
+        if predictor_initial_state is None:
+            predictor_initial_state = predictor.initial_state(batch_size)
+        predictor_output, _ = hk.dynamic_unroll(
+            predictor,
+            (batch.observation, batch.mask),
+            predictor_initial_state,
+        )
+
+        # Prediction losses
+        conditional_nll = -policy_outputs.pred.as_distrax().log_prob(
+            batch.next_observation
+        )
+        marginal_nll = -predictor_output.as_distrax().log_prob(batch.next_observation)
+        conditional_nll = jnp.mean(conditional_nll)
+        marginal_nll = jnp.mean(marginal_nll)
+
+        # Policy loss
+        policy = policy_outputs.policy.as_distrax()
+        log_prob = policy.log_prob(batch.action)
+        prob_ratio = jnp.exp(log_prob - batch.log_prob)
+
+        policy_loss = batched_ppoclip_loss(
+            prob_ratio,
+            batch.advantage,
+            self._config.clip_epsilon,
+        )
+        policy_loss = jnp.mean(policy_loss)
+
+        # Value loss
+        value = policy_outputs.value.reshape(batch.value_target.shape)
+        value_loss = jnp.mean(rlax.l2_loss(value, batch.value_target))
+
+        loss = (
+            policy_loss
+            + value_loss
+            - self._config.entropy_coef * jnp.sum(policy.entropy())
+            + conditional_nll
+            + marginal_nll
+        )
+
+        metrics = {
+            "policy_loss": policy_loss,
+            "value_loss": value_loss,
+            "conditional_nll": conditional_nll,
+            "marginal_nll": marginal_nll,
+            "conditional-mean": jnp.mean(policy_outputs.pred.mean),
+            "conditional-stddev": jnp.mean(policy_outputs.pred.stddev),
+            "marginal-mean": jnp.mean(predictor_output.mean),
+            "marginal-stddev": jnp.mean(predictor_output.stddev),
+        }
+
+        return loss, metrics
 
 
 class Learner:
@@ -459,7 +553,7 @@ class Learner:
         self._next_value = jax.jit(next_value)
 
         def loss_fn(
-            batch: MusicBatch,
+            batch: Batch,
             policy_initial_state: t.Optional[hk.LSTMState],
             predictor_initial_state: t.Optional[hk.LSTMState],
         ) -> t.Tuple[chex.Array, t.Dict[str, chex.Array]]:
@@ -536,7 +630,7 @@ class Learner:
             params: hk.Params,
             prng_key: chex.PRNGKey,
             opt_state: optax.OptState,
-            batch: MusicBatch,
+            batch: Batch,
             policy_initial_state: t.Optional[hk.LSTMState],
             predictor_initial_state: t.Optional[hk.LSTMState],
         ) -> t.Tuple[hk.Params, optax.OptState, t.Dict[str, chex.Array]]:

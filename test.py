@@ -2,30 +2,32 @@ import chex
 import haiku as hk
 import jax
 import jax.numpy as jnp
+import pytest
 import rlax
 
 from brax.envs import create as create_brax_env
 
 from udance import (
     Config,
+    MusicDecoder,
+    MusicEncoder,
     MusicIter,
-    MusicPolicy,
-    MusicRNN,
-    ObsPredictor,
-    RolloutWithMusic,
-    _make_music_batch,
+    Policy,
+    Rollout,
+    _make_batch,
     batched_gae,
     batched_ppoclip_loss,
     load_jsb,
     make_onestep_fn,
+    make_rewardgen_fn,
 )
 
-T, N, S, A, P = 5, 4, 3, 2, 6
+T, N, S, A, P, Z = 5, 4, 3, 2, 6, 4
 
 
 @pytest.fixture
 def config() -> Config:
-    return Config(rnn_hiddne_dim=12, hidden_dims=(8, 8))
+    return Config(hidden_dims=(8, 8), rnn_hidden_dims=(8, 8), music_latent_dim=Z)
 
 
 def test_gae(config: Config) -> None:
@@ -50,68 +52,97 @@ def test_batched_ppo_loss(config: Config) -> None:
     chex.assert_shape(policy_loss, (T,))
 
 
-def test_music_rnn(config: Config) -> None:
-    init, music_rnn = hk.transform(lambda x: MusicRNN(P, config)(x))
+def test_music_encoder(config: Config) -> None:
+    def forward(pitch, mask):
+        encoder = MusicEncoder(P, config)
+        latent, _ = encoder((pitch, mask), encoder.initial_state(N))
+        return latent
+
+    init, music_encoder = hk.transform(forward)
     pitch = jnp.ones((N,), dtype=jnp.int32)
     mask = jnp.zeros((N,))
-    params = init(jax.random.PRNGKey(43), (pitch, mask))
-    output, _ = music_policy(params, jax.random.PRNGKey(44), (pitch, mask))
+    params = init(jax.random.PRNGKey(43), pitch, mask)
+    latent = music_encoder(params, jax.random.PRNGKey(44), pitch, mask)
+    chex.assert_shape(jax.tree_flatten(latent)[0], (N, Z))
 
 
-def test_music_policy(config: Config) -> None:
-    init, music_policy = hk.transform(lambda x: MusicPolicy(A, S, P, config)(x))
+def test_encode_and_decode(config: Config) -> None:
+    def forward(pitch, mask):
+        encoder = MusicEncoder(P, config)
+        latent, _state = encoder((pitch, mask), encoder.initial_state(N))
+        decoder = MusicDecoder(P, config)
+        logits, _state = decoder((latent.latent, mask), decoder.initial_state(N))
+        return logits
+
+    init, encode_decode = hk.transform(forward)
+    pitch = jnp.ones((N,), dtype=jnp.int32)
+    mask = jnp.zeros((N,))
+    params = init(jax.random.PRNGKey(43), pitch, mask)
+    logits = encode_decode(params, jax.random.PRNGKey(44), pitch, mask)
+    chex.assert_shape(logits, (N, P))
+
+
+def test_reward_gen(config: Config) -> None:
+    init, reward_gen = make_rewardgen_fn(S, config)
+    obs = jnp.ones((T + 1, N, S))
+    music_latent = jnp.ones((T, N, Z))
+    params = init(jax.random.PRNGKey(43), obs, music_latent)
+    reward = reward_gen(params, obs, music_latent)
+    chex.assert_shape(reward, (T, N))
+
+
+def test_batch(config: Config) -> None:
     obs = jnp.ones((N, S))
     pitch = jnp.ones((N,), dtype=jnp.int32)
     mask = jnp.zeros((N,))
-    params = init(jax.random.PRNGKey(43), (obs, pitch, mask))
-    output, state = music_policy(params, jax.random.PRNGKey(44), (obs, pitch, mask))
-    chex.assert_shape((output.policy.mean, output.policy.stddev), (N, A))
-    chex.assert_shape((output.pred.mean, output.pred.stddev), (N, S))
-    chex.assert_shape(output.value, (N, 1))
 
+    def forward():
+        music_encoder = MusicEncoder(n_pitches=P, config=config)
+        rnn_state = music_encoder.initial_state(N)
+        music_latent, next_rnn_state = music_encoder((pitch, mask), rnn_state)
+        policy = Policy(action_dim=A, config=config)
+        policy_out = policy(obs, music_latent.latent)
+        action = policy_out.policy.as_distrax().sample(seed=hk.next_rng_key())
+        return action, policy_out, music_latent
 
-def test_music_batch() -> None:
-    config = Config()
-    init_mp, music_policy = hk.transform(
-        lambda x, state: MusicPolicy(A, S, P, config)(x, state)
-    )
-    init_op, obs_predictor = hk.transform(
-        lambda x, state: ObsPredictor(S, config)(x, state)
-    )
-    obs = jnp.ones((N, S))
-    pitch = jnp.ones((N,), dtype=jnp.int32)
-    mask = jnp.zeros((N,))
-    params_m = init_mp(jax.random.PRNGKey(43), (obs, pitch, mask), None)
-    params_o = init_op(jax.random.PRNGKey(44), (obs, mask), None)
-    rollout = RolloutWithMusic(observations=[obs])
-    policy_hidden, predictor_hidden = None, None
+    init, fwd = hk.transform(forward)
+    params = init(jax.random.PRNGKey(43))
+    rollout = Rollout(observations=[obs])
     for i in range(T):
-        policy_out, policy_hidden = music_policy(
-            params_m,
-            jax.random.PRNGKey(45 + i),
-            (obs, pitch, mask),
-            policy_hidden,
-        )
-        predictor_out, predictor_hidden = obs_predictor(
-            params_o,
-            jax.random.PRNGKey(90 + i),
-            (obs, mask),
-            predictor_hidden,
-        )
+        action, policy_out, music_latent = fwd(params, jax.random.PRNGKey(44 + i))
         rollout.append(
             observation=obs,
             music=pitch,
-            action=jnp.ones((N, A)),
-            policy_out=policy_out,
-            predictor_out=predictor_out,
+            action=action,
             terminal=jnp.zeros((N,), dtype=bool),
+            output=policy_out,
+            music_latent=music_latent.latent,
         )
 
-    batch, _, _ = _make_music_batch(rollout, jnp.ones((N,)), config)
-    chex.assert_shape(batch.observation, (T, N, S))
+    init, reward_gen = make_rewardgen_fn(S, config)
+    rewgen_params = init(
+        jax.random.PRNGKey(44 + T),
+        jnp.ones((T + 1, N, S)),
+        jnp.ones((T, N, Z)),
+    )
+    batch, reward, raw_reward = _make_batch(
+        rollout,
+        jnp.ones((N,)),
+        lambda obs, music_latent: reward_gen(rewgen_params, obs, music_latent),
+        config,
+    )
+
+    chex.assert_shape((batch.observation, batch.next_observation), (T, N, S))
     chex.assert_shape(batch.action, (T, N, A))
     chex.assert_shape(
-        (batch.advantage, batch.value_target, batch.log_prob, batch.music),
+        (
+            batch.advantage,
+            batch.value_target,
+            batch.log_prob,
+            batch.music,
+            reward,
+            raw_reward,
+        ),
         (T, N),
     )
 
@@ -131,26 +162,24 @@ def test_onestep_fn() -> None:
     params = init(
         jax.random.PRNGKey(46),
         state,
-        None,
-        None,
         music,
+        None,
         jnp.zeros((4,), dtype=bool),
     )
-    state, action, policy_out, policy_state, predictor_out, predictor_state = onestep(
+    state, action, policy_out, music_latant, rnn_state = onestep(
         params,
         jax.random.PRNGKey(47),
         state,
-        None,
-        None,
         music,
+        None,
         jnp.zeros((4,), dtype=bool),
     )
-    S, A = env.observation_size, env.action_size
-    chex.assert_shape((action, *jax.tree_flatten(policy_out.policy)[0]), (N, A))
+    A = env.action_size
     chex.assert_shape(
-        jax.tree_flatten(policy_out.pred)[0] + jax.tree_flatten(predictor_out)[0],
-        (N, S),
+        (action, policy_out.policy.mean, policy_out.policy.stddev),
+        (N, A),
     )
+    chex.assert_shape(music_latant, (N, Z))
 
 
 def test_music_iter() -> None:
