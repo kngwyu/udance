@@ -776,7 +776,6 @@ def train(
             )
             for music in eval_music:
                 eval_state, _, _, _ = eval_actor.step(
-                    onestep_fn=eval_one_step,
                     state=eval_state,
                     music=music.reshape((1,)),
                     prng_key=next(prng_seq),
