@@ -8,16 +8,18 @@ import rlax
 from brax.envs import create as create_brax_env
 
 from udance import (
+    Batch,
     Config,
     MusicDecoder,
     MusicEncoder,
     MusicIter,
     Policy,
     Rollout,
-    _make_batch,
     batched_gae,
     batched_ppoclip_loss,
     load_jsb,
+    make_batch,
+    make_loss_fn,
     make_onestep_fn,
     make_rewardgen_fn,
 )
@@ -91,7 +93,7 @@ def test_reward_gen(config: Config) -> None:
     chex.assert_shape(reward, (T, N))
 
 
-def test_batch(config: Config) -> None:
+def test_batch(config: Config) -> Batch:
     obs = jnp.ones((N, S))
     pitch = jnp.ones((N,), dtype=jnp.int32)
     mask = jnp.zeros((N,))
@@ -125,7 +127,7 @@ def test_batch(config: Config) -> None:
         jnp.ones((T + 1, N, S)),
         jnp.ones((T, N, Z)),
     )
-    batch, reward, raw_reward = _make_batch(
+    batch, reward, raw_reward = make_batch(
         rollout,
         jnp.ones((N,)),
         lambda obs, music_latent: reward_gen(rewgen_params, obs, music_latent),
@@ -145,6 +147,8 @@ def test_batch(config: Config) -> None:
         ),
         (T, N),
     )
+
+    return batch
 
 
 def test_onestep_fn() -> None:
@@ -195,3 +199,11 @@ def test_music_iter() -> None:
     for _ in range(min(length)):
         _, ended = next(music_iter)
     assert sum(ended) == 1
+
+
+def test_loss_fn(config: Config) -> None:
+    init, loss_fn = make_loss_fn(A, S, P, config)
+    batch = test_batch(config)
+    params = init(jax.random.PRNGKey(42), batch, 2.0)
+    loss, metrics = loss_fn(params, jax.random.PRNGKey(41), batch, 2.0)
+    chex.assert_shape([loss] + list(metrics.values()), ())
