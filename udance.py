@@ -766,6 +766,7 @@ def train(
         if (i + 1) % logging_freq == 0:
             with metrics_file.open(mode="a") as f:
                 json.dump(metrics, f)
+                f.write("\n")
         if (i + 1) % eval_freq == 0:
             eval_state = eval_env.reset(next(prng_seq))
             qps = [jax.tree_map(lambda x: x.reshape(x.shape[1:]), eval_state.qp)]
