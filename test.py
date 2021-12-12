@@ -88,9 +88,9 @@ def test_reward_gen(config: Config) -> None:
     init, reward_gen = make_rewardgen_fn(S, config)
     obs = jnp.ones((T + 1, N, S))
     music_latent = jnp.ones((T, N, Z))
-    params = init(jax.random.PRNGKey(43), obs, music_latent)
-    reward = reward_gen(params, obs, music_latent)
-    chex.assert_shape(reward, (T, N))
+    params, state = init(jax.random.PRNGKey(43), obs, music_latent)
+    rewards, new_state = reward_gen(params, state, obs, music_latent)
+    chex.assert_shape(rewards, (T, N))
 
 
 def test_batch(config: Config) -> Batch:
@@ -121,30 +121,17 @@ def test_batch(config: Config) -> Batch:
             music_latent=music_latent.latent,
         )
 
-    init, reward_gen = make_rewardgen_fn(S, config)
-    rewgen_params = init(
-        jax.random.PRNGKey(44 + T),
-        jnp.ones((T + 1, N, S)),
-        jnp.ones((T, N, Z)),
-    )
-    batch, reward, raw_reward = make_batch(
+    batch = make_batch(
         rollout,
         jnp.ones((N,)),
-        lambda obs, music_latent: reward_gen(rewgen_params, obs, music_latent),
+        jnp.ones((T, N)),
         config,
     )
 
     chex.assert_shape((batch.observation, batch.next_observation), (T, N, S))
     chex.assert_shape(batch.action, (T, N, A))
     chex.assert_shape(
-        (
-            batch.advantage,
-            batch.value_target,
-            batch.log_prob,
-            batch.music,
-            reward,
-            raw_reward,
-        ),
+        (batch.advantage, batch.value_target, batch.log_prob, batch.music),
         (T, N),
     )
 

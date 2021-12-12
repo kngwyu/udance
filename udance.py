@@ -42,7 +42,7 @@ class Config:
     gae_lambda: float = 0.95
     n_optim_epochs: int = 10
     n_minibatches: int = 4
-    reward_scaling: float = 0.1
+    reward_clip: float = 100.0
     # Network config
     hidden_dims: t.Sequence[int] = (64, 64)
     rnn_hidden_dims: t.Sequence[int] = (128, 64)
@@ -155,27 +155,22 @@ class MusicEncoder(hk.RNNCore):
 class MusicDecoder(hk.RNNCore):
     def __init__(self, n_pitches: int, config: Config) -> None:
         super().__init__(name="music_decoder")
-        self._lstm1 = hk.LSTM(config.rnn_hidden_dims[1])
-        self._lstm2 = hk.LSTM(config.rnn_hidden_dims[0])
+        self._lstm = hk.LSTM(config.rnn_hidden_dims[0])
         self._decoder = hk.Linear(n_pitches, w_init=orthogonal(1.0))
 
-    def initial_state(self, batch_size: t.Optional[int]) -> MusicRNNState:
-        s1 = self._lstm1.initial_state(batch_size)
-        s2 = self._lstm2.initial_state(batch_size)
-        return s1, s2
+    def initial_state(self, batch_size: t.Optional[int]) -> hk.LSTMState:
+        return self._lstm.initial_state(batch_size)
 
     def __call__(
         self,
         inputs: t.Tuple[chex.Array, chex.Array],
-        prev_state: MusicRNNState,
-    ) -> t.Tuple[MusicLatent, MusicRNNState]:
+        prev_state: hk.LSTMState,
+    ) -> t.Tuple[MusicLatent, hk.LSTMState]:
         latent, mask = inputs
-        state1, state2 = jax.tree_map(lambda x: x * mask.reshape(-1, 1), prev_state)
-        x, next_state1 = self._lstm1(latent, state1)
-        x = jax.nn.relu(x)
-        x, next_state2 = self._lstm2(x, state2)
+        state = jax.tree_map(lambda x: x * mask.reshape(-1, 1), prev_state)
+        x, next_state = self._lstm(latent, state)
         logit = self._decoder(x)
-        return logit, (next_state1, next_state2)
+        return logit, next_state
 
 
 class PolicyOutput(t.NamedTuple):
@@ -276,6 +271,9 @@ class Rollout:
     outputs: t.List[PolicyOutput] = dataclasses.field(default_factory=list)
     music_latents: t.List[chex.Array] = dataclasses.field(default_factory=list)
 
+    def __post_init__(self) -> None:
+        self.terminals.append(jnp.zeros(self.observations[0].shape[0], dtype=bool))
+
     def append(
         self,
         *,
@@ -295,9 +293,9 @@ class Rollout:
 
     def clear(self) -> None:
         self.observations = [self.observations[-1]]
+        self.terminals = [self.terminals[-1]]
         self.musics.clear()
         self.actions.clear()
-        self.terminals.clear()
         self.outputs.clear()
         self.music_latents.clear()
 
@@ -311,6 +309,7 @@ class Batch(t.NamedTuple):
     value_target: chex.Array
     log_prob: chex.Array
     mask: chex.Array
+    prev_mask: chex.Array
 
     def __getitem__(self, idx: Array) -> Self:
         return self.__class__(
@@ -322,6 +321,7 @@ class Batch(t.NamedTuple):
             value_target=self.value_target[:, idx],
             log_prob=self.log_prob[:, idx],
             mask=self.mask[:, idx],
+            prev_mask=self.prev_mask[:, idx],
         )
 
 
@@ -335,22 +335,20 @@ def dummy_batch(observation_dim: int, action_dim: int) -> Batch:
         value_target=jnp.ones((2, 1)),
         log_prob=jnp.ones((2, 1)),
         mask=jnp.ones((2, 1)),
+        prev_mask=jnp.ones((2, 1)),
     )
 
 
 def make_batch(
     rollout: Rollout,
     next_value: chex.Array,
-    gen_reward: t.Callable[[chex.Array, chex.Array], chex.Array],
+    reward: chex.Array,
     config: Config,
 ) -> t.Tuple[Batch, chex.Array, chex.Array]:
-    # Observation, music_latents
-    observation = jnp.stack(rollout.observations)  # T, N, obs-dim
-    # Compute rewards
-    raw_reward = gen_reward(observation, jnp.stack(rollout.music_latents))
-    reward = jnp.clip(raw_reward, a_min=-1.0, a_max=1.0)
+    # Observation
+    observation = jnp.stack(rollout.observations)  # T + 1, N, obs-dim
     # Compute advantage
-    mask = 1.0 - jnp.stack(rollout.terminals)
+    mask = 1.0 - jnp.stack(rollout.terminals[1:])
     policy_outputs = jax.tree_map(lambda *x: jnp.stack(x), *rollout.outputs)
     value_t = policy_outputs.value.reshape(reward.shape)
     value_t1 = jnp.concatenate((value_t, next_value.reshape(1, -1)), axis=0)
@@ -368,12 +366,33 @@ def make_batch(
         value_target=value_target,
         log_prob=log_prob,
         mask=mask,
+        prev_mask=1.0 - jnp.stack(rollout.terminals[:-1]),
     )
-    return batch, reward, raw_reward
+    return batch
 
 
 def make_rewardgen_fn(observation_dim: int, config: Config) -> hk.Transformed:
-    def gen_rewards(observation: chex.Array, music_latent: chex.Array) -> chex.Array:
+    def _update_rms(
+        mean: chex.Array,
+        var: chex.Array,
+        count: float,
+        batch: chex.Array,
+    ) -> t.Tuple[chex.Array, chex.Array, float]:
+        batch_mean = jnp.mean(batch)
+        batch_size = batch.shape[0]
+        delta = batch_mean - mean
+        total_count = count + batch_size
+        new_mean = mean + delta * batch_size / total_count
+        m_a = var * count
+        m_b = jnp.var(batch) * batch_size
+        m2 = m_a + m_b + jnp.square(delta) * count * batch_size / total_count
+        new_var = m2 / total_count
+        return new_mean, new_var, total_count
+
+    def gen_rewards(
+        observation: chex.Array,
+        music_latent: chex.Array,
+    ) -> t.Tuple[chex.Array, chex.Array]:
         """log q(x'|x, z) - Σz' log q(x'|x, z')"""
         chex.assert_rank((observation, music_latent), 3)  # T + 1, N, O/H
         n_steps, n_workers, _ = music_latent.shape
@@ -388,9 +407,34 @@ def make_rewardgen_fn(observation_dim: int, config: Config) -> hk.Transformed:
         # Then compute log q(x'|x, z)
         dist = predictor(observation[:-1], music_latent)
         logq = dist.as_distrax().log_prob(observation[1:])
-        return logq - logq_sum + jnp.log(n_workers)
+        raw_reward = logq - logq_sum + jnp.log(n_workers)
+        # Normalize reward
+        reward_mean = hk.get_state("reward_mean", shape=(), init=jnp.zeros)
+        reward_var = hk.get_state("reward_var", shape=(), init=jnp.ones)
+        reward_count = hk.get_state(
+            "reward_count",
+            shape=(),
+            init=lambda *args: jnp.ones(*args) * 1e-4,
+        )
+        new_mean, new_var, new_count = _update_rms(
+            reward_mean,
+            reward_var,
+            reward_count,
+            raw_reward,
+        )
+        hk.set_state("reward_mean", new_mean)
+        hk.set_state("reward_var", new_var)
+        hk.set_state("reward_count", new_count)
+        std = jnp.sqrt(new_var + 1e-8)
+        normalized_reward = (raw_reward - new_mean) / std
+        clipped_reward = jnp.clip(
+            normalized_reward,
+            a_min=-config.reward_clip,
+            a_max=config.reward_clip,
+        )
+        return clipped_reward, raw_reward
 
-    return hk.without_apply_rng(hk.transform(gen_rewards))
+    return hk.without_apply_rng(hk.transform_with_state(gen_rewards))
 
 
 StepFn = t.Callable[
@@ -483,8 +527,9 @@ def make_loss_fn(
         music_decoder = MusicDecoder(n_pitches=n_pitches, config=config)
         music_logits, _ = hk.dynamic_unroll(
             music_decoder,
-            (music_latents.latent, batch.mask),
+            (music_latents.latent, batch.prev_mask),
             music_decoder.initial_state(batch.observation.shape[1]),
+            reverse=True,
         )
         music_distrib = distrax.Categorical(logits=music_logits)
         music_nll = -jnp.mean(music_distrib.log_prob(batch.music))
@@ -538,12 +583,17 @@ class Learner:
         loss_fn: t.Callable[..., t.Tuple[chex.Array, dict]],
         action_dim: int,
         optimizer: optax.GradientTransformation,
-        gen_reward: t.Callable[[hk.Params, chex.Array, chex.Array], chex.Array],
+        gen_reward: t.Callable[
+            [hk.Params, hk.State, chex.Array, chex.Array],
+            chex.Array,
+        ],
+        gen_reward_state: hk.State,
         config: Config,
     ) -> None:
         self._actor = actor
         self._config = config
-        self._gen_reward_raw = gen_reward
+        self._gen_reward = jax.jit(gen_reward)
+        self._gen_reward_state = gen_reward_state
         self._opt_state = optimizer.init(actor.params)
         self._opt_update = optimizer.update
 
@@ -569,26 +619,24 @@ class Learner:
 
         self._update = jax.jit(update)
 
-    def _gen_reward(self, obs: chex.Array, music_latent: chex.Array) -> chex.Array:
-        return self._gen_reward_raw(self._actor.params, obs, music_latent)
-
     def learn(
         self,
         rollout: Rollout,
         beta: float,
         prng_seq: hk.PRNGSequence,
     ) -> t.Dict[str, float]:
+        (reward, raw_reward), self._gen_reward_state = self._gen_reward(
+            self._actor.params,
+            self._gen_reward_state,
+            jnp.stack(rollout.observations),
+            jnp.stack(rollout.music_latents),
+        )
         next_value = self._next_value(
             self._actor.params,
             rollout.observations[-1],
             rollout.music_latents[-1],
         )
-        batch, reward, raw_reward = make_batch(
-            rollout,
-            next_value,
-            self._gen_reward,
-            self._config,
-        )
+        batch = make_batch(rollout, next_value, reward, config=self._config)
         metrics = collections.defaultdict(lambda: 0.0)
 
         for _ in range(self._config.n_optim_epochs):
@@ -612,6 +660,8 @@ class Learner:
         metrics["raw-reward-min"] = jnp.min(raw_reward).item()
         metrics["raw-reward-max"] = jnp.max(raw_reward).item()
         metrics["raw-reward-avg"] = jnp.mean(raw_reward).item()
+        metrics["reward-min"] = jnp.min(reward).item()
+        metrics["reward-max"] = jnp.max(reward).item()
         metrics["reward-avg"] = jnp.mean(reward).item()
         return metrics
 
@@ -666,7 +716,7 @@ def train(
     env_name: str = "ant",
     n_train_midi: int = 64,
     n_eval_midi: int = 16,
-    n_workers: int = 16,
+    n_workers: int = 32,
     n_rollout_steps: int = 128,
     n_training_steps: int = 1000,
     logging_freq: int = 10,
@@ -721,7 +771,12 @@ def train(
         1.0,
     )
     actor = Actor(params=initial_params, rnn_state=None, step_fn=train_one_step)
-    _, gen_reward = make_rewardgen_fn(env.observation_size, config)
+    init_genrew, gen_reward = make_rewardgen_fn(env.observation_size, config)
+    _, gen_reward_state = init_genrew(
+        next(prng_seq),
+        jnp.ones((2, 1, env.observation_size)),
+        jnp.ones((1, 1, config.music_latent_dim)),
+    )
     learner = Learner(
         actor=actor,
         loss_fn=loss_fn,
@@ -731,6 +786,7 @@ def train(
             optax.adam(3e-4, eps=1e-4),
         ),
         gen_reward=gen_reward,
+        gen_reward_state=gen_reward_state,
         config=config,
     )
     rollout = Rollout(observations=[state.obs])
