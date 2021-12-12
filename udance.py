@@ -3,6 +3,7 @@ import dataclasses
 import functools
 import json
 import pathlib
+import pickle
 import typing as t
 
 import chex
@@ -710,17 +711,30 @@ def load_jsb(root: str) -> t.Tuple[t.List[chex.Array], int]:
     return _to_pitches(jsb)
 
 
+@dataclasses.dataclass
+class ModelSaver:
+    logdir: pathlib.Path
+    count: int = 0
+
+    def save_params(self, params: hk.Params) -> None:
+        filename = f"model-{self.count}.pickle"
+        with self.logdir.joinpath(filename).open(mode="wb") as f:
+            pickle.dump(params, f)
+        self.count += 1
+
+
 def train(
     log_dir: str,
     midi_dir: str,
     env_name: str = "ant",
-    n_train_midi: int = 64,
+    n_train_midi: int = 128,
     n_eval_midi: int = 16,
     n_workers: int = 32,
     n_rollout_steps: int = 128,
     n_training_steps: int = 1000,
     logging_freq: int = 10,
-    eval_freq: float = 100,
+    eval_freq: int = 100,
+    save_freq: int = 100,
     beta_min: float = 1.0,
     beta_max: float = 4.0,
     seed: int = 0,
@@ -796,6 +810,7 @@ def train(
     viewer_id = 1
     beta = beta_max
     delta_beta = (beta_max - beta_min) / n_training_steps
+    model_saver = ModelSaver(log_dir)
     # Training loop
     for i in tqdm.tqdm(range(n_training_steps)):
         # Rollout
@@ -823,6 +838,8 @@ def train(
             with metrics_file.open(mode="a") as f:
                 json.dump(metrics, f)
                 f.write("\n")
+        if (i + 1) % save_freq == 0:
+            model_saver.save_params(actor.params)
         if (i + 1) % eval_freq == 0:
             eval_state = eval_env.reset(next(prng_seq))
             qps = [jax.tree_map(lambda x: x.reshape(x.shape[1:]), eval_state.qp)]
