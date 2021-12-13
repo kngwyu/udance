@@ -118,10 +118,10 @@ MusicRNNState = t.Tuple[hk.LSTMState, hk.LSTMState]
 class MusicEncoder(hk.RNNCore):
     """Encode a sequence of music to a latent vector z"""
 
-    def __init__(self, n_pitches: int, config: Config) -> None:
+    def __init__(self, n_events: int, config: Config) -> None:
         super().__init__(name="music_encoder")
         self._encoder = hk.Embed(
-            vocab_size=n_pitches,
+            vocab_size=n_events,
             embed_dim=config.rnn_hidden_dims[0],
             w_init=orthogonal(np.sqrt(2.0)),
         )
@@ -154,10 +154,10 @@ class MusicEncoder(hk.RNNCore):
 
 
 class MusicDecoder(hk.RNNCore):
-    def __init__(self, n_pitches: int, config: Config) -> None:
+    def __init__(self, n_events: int, config: Config) -> None:
         super().__init__(name="music_decoder")
         self._lstm = hk.LSTM(config.rnn_hidden_dims[0])
-        self._decoder = hk.Linear(n_pitches, w_init=orthogonal(1.0))
+        self._decoder = hk.Linear(n_events, w_init=orthogonal(1.0))
 
     def initial_state(self, batch_size: t.Optional[int]) -> hk.LSTMState:
         return self._lstm.initial_state(batch_size)
@@ -446,7 +446,7 @@ StepFn = t.Callable[
 
 def make_onestep_fn(
     env: Env,
-    n_pitches: int,
+    n_events: int,
     config: Config,
 ) -> hk.Transformed:
     def step_impl(
@@ -457,7 +457,7 @@ def make_onestep_fn(
     ) -> t.Tuple[BraxState, chex.Array, PolicyOutput, chex.Array, MusicRNNState]:
         # 1. Encode music
         mask = 1.0 - prev_terminal
-        music_encoder = MusicEncoder(n_pitches=n_pitches, config=config)
+        music_encoder = MusicEncoder(n_events=n_events, config=config)
         if rnn_state is None:
             rnn_state = music_encoder.initial_state(music.shape[0])
         music_latent, next_rnn_state = music_encoder((music, mask), rnn_state)
@@ -509,7 +509,7 @@ class Actor:
 def make_loss_fn(
     action_dim: int,
     observation_dim: int,
-    n_pitches: int,
+    n_events: int,
     config: Config,
 ) -> hk.Transformed:
     def loss_fn(
@@ -517,7 +517,7 @@ def make_loss_fn(
         beta: float,
     ) -> t.Tuple[chex.Array, t.Dict[str, chex.Array]]:
         # 1. Encode music
-        music_encoder = MusicEncoder(n_pitches=n_pitches, config=config)
+        music_encoder = MusicEncoder(n_events=n_events, config=config)
         music_latents, _ = hk.dynamic_unroll(
             music_encoder,
             (batch.music, batch.mask),
@@ -525,7 +525,7 @@ def make_loss_fn(
         )
         latent_kl = jnp.mean(music_latents.dist.kld_to_std())
         # 2. Decode music
-        music_decoder = MusicDecoder(n_pitches=n_pitches, config=config)
+        music_decoder = MusicDecoder(n_events=n_events, config=config)
         music_logits, _ = hk.dynamic_unroll(
             music_decoder,
             (music_latents.latent, batch.prev_mask),
@@ -696,19 +696,24 @@ class MusicIter:
         res = [self._musics[i][j] for i, j in zip(self._selected, self._indices)]
         for i in range(self._n_workers):
             self._indices[i] += 1
-        return jnp.concatenate(res), jnp.array(ended)
+        return jnp.stack(res), jnp.array(ended)
 
 
-def _to_pitches(musics: t.List[muspy.Music]) -> t.Tuple[t.List[chex.Array], int]:
-    pitches = [muspy.to_pitch_representation(music) for music in musics]
-    min_value = min([np.min(pitch) for pitch in pitches])
-    max_value = max([np.max(pitch) for pitch in pitches])
-    return [jnp.array(pitch - min_value) for pitch in pitches], max_value - min_value
+def _to_events(
+    musics: t.List[muspy.Music],
+    min_event_length: int,
+) -> t.Tuple[t.List[chex.Array], int]:
+    events = [muspy.to_event_representation(music) for music in musics]
+    events = [event[event < 356].astype(int) for event in events]
+    events = [event for event in events if event.shape[0] > min_event_length]
+    min_value = min([np.min(event) for event in events])
+    max_value = max([np.max(event) for event in events])
+    return [jnp.array(event - min_value) for event in events], max_value - min_value
 
 
-def load_jsb(root: str) -> t.Tuple[t.List[chex.Array], int]:
-    jsb = muspy.JSBChoralesDataset(root, download_and_extract=True).convert()
-    return _to_pitches(jsb)
+def load_emopia(root: str, min_event_length: int) -> t.Tuple[t.List[chex.Array], int]:
+    emopia = muspy.EMOPIADataset(root, True).convert()
+    return _to_events(emopia, min_event_length)
 
 
 @dataclasses.dataclass
@@ -737,6 +742,7 @@ def train(
     save_freq: int = 100,
     beta_min: float = 1.0,
     beta_max: float = 4.0,
+    min_event_length: int = 500,
     seed: int = 0,
 ) -> None:
     # Prepare env and MusicIter
@@ -755,14 +761,14 @@ def train(
         batch_size=1,
     )
     prng_seq = hk.PRNGSequence(seed)
-    pitches, n_pitches = load_jsb(midi_dir)
+    events, n_events = load_emopia(midi_dir, min_event_length)
     train_music_iter = MusicIter(
-        musics=pitches[:n_train_midi],
+        musics=events[:n_train_midi],
         n_workers=n_workers,
         seed=seed,
     )
     eval_music_iter = MusicIter(
-        musics=pitches[n_train_midi : n_train_midi + n_eval_midi],
+        musics=events[n_train_midi : n_train_midi + n_eval_midi],
         n_workers=1,
         seed=seed,
     )
@@ -770,13 +776,13 @@ def train(
     # Actor and training states
     state = env.reset(rng=next(prng_seq))
     config = Config()
-    _, train_one_step = make_onestep_fn(env=env, n_pitches=n_pitches, config=config)
-    _, eval_one_step = make_onestep_fn(env=eval_env, n_pitches=n_pitches, config=config)
+    _, train_one_step = make_onestep_fn(env=env, n_events=n_events, config=config)
+    _, eval_one_step = make_onestep_fn(env=eval_env, n_events=n_events, config=config)
     prev_terminal = jnp.zeros((n_workers,), dtype=bool)
     init, loss_fn = make_loss_fn(
         action_dim=env.action_size,
         observation_dim=env.observation_size,
-        n_pitches=n_pitches,
+        n_events=n_events,
         config=config,
     )
     initial_params = init(

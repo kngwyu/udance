@@ -17,14 +17,14 @@ from udance import (
     Rollout,
     batched_gae,
     batched_ppoclip_loss,
-    load_jsb,
+    load_emopia,
     make_batch,
     make_loss_fn,
     make_onestep_fn,
     make_rewardgen_fn,
 )
 
-T, N, S, A, P, Z = 5, 4, 3, 2, 6, 4
+T, N, S, A, E, Z = 5, 4, 3, 2, 6, 4
 
 
 @pytest.fixture
@@ -55,33 +55,33 @@ def test_batched_ppo_loss(config: Config) -> None:
 
 
 def test_music_encoder(config: Config) -> None:
-    def forward(pitch, mask):
-        encoder = MusicEncoder(P, config)
-        latent, _ = encoder((pitch, mask), encoder.initial_state(N))
+    def forward(event, mask):
+        encoder = MusicEncoder(E, config)
+        latent, _ = encoder((event, mask), encoder.initial_state(N))
         return latent
 
     init, music_encoder = hk.transform(forward)
-    pitch = jnp.ones((N,), dtype=jnp.int32)
+    event = jnp.ones((N,), dtype=jnp.int32)
     mask = jnp.zeros((N,))
-    params = init(jax.random.PRNGKey(43), pitch, mask)
-    latent = music_encoder(params, jax.random.PRNGKey(44), pitch, mask)
+    params = init(jax.random.PRNGKey(43), event, mask)
+    latent = music_encoder(params, jax.random.PRNGKey(44), event, mask)
     chex.assert_shape(jax.tree_flatten(latent)[0], (N, Z))
 
 
 def test_encode_and_decode(config: Config) -> None:
-    def forward(pitch, mask):
-        encoder = MusicEncoder(P, config)
-        latent, _state = encoder((pitch, mask), encoder.initial_state(N))
-        decoder = MusicDecoder(P, config)
+    def forward(event, mask):
+        encoder = MusicEncoder(E, config)
+        latent, _state = encoder((event, mask), encoder.initial_state(N))
+        decoder = MusicDecoder(E, config)
         logits, _state = decoder((latent.latent, mask), decoder.initial_state(N))
         return logits
 
     init, encode_decode = hk.transform(forward)
-    pitch = jnp.ones((N,), dtype=jnp.int32)
+    event = jnp.ones((N,), dtype=jnp.int32)
     mask = jnp.zeros((N,))
-    params = init(jax.random.PRNGKey(43), pitch, mask)
-    logits = encode_decode(params, jax.random.PRNGKey(44), pitch, mask)
-    chex.assert_shape(logits, (N, P))
+    params = init(jax.random.PRNGKey(43), event, mask)
+    logits = encode_decode(params, jax.random.PRNGKey(44), event, mask)
+    chex.assert_shape(logits, (N, E))
 
 
 def test_reward_gen(config: Config) -> None:
@@ -95,13 +95,13 @@ def test_reward_gen(config: Config) -> None:
 
 def test_batch(config: Config) -> Batch:
     obs = jnp.ones((N, S))
-    pitch = jnp.ones((N,), dtype=jnp.int32)
+    event = jnp.ones((N,), dtype=jnp.int32)
     mask = jnp.zeros((N,))
 
     def forward():
-        music_encoder = MusicEncoder(n_pitches=P, config=config)
+        music_encoder = MusicEncoder(n_events=E, config=config)
         rnn_state = music_encoder.initial_state(N)
-        music_latent, next_rnn_state = music_encoder((pitch, mask), rnn_state)
+        music_latent, next_rnn_state = music_encoder((event, mask), rnn_state)
         policy = Policy(action_dim=A, config=config)
         policy_out = policy(obs, music_latent.latent)
         action = policy_out.policy.as_distrax().sample(seed=hk.next_rng_key())
@@ -114,7 +114,7 @@ def test_batch(config: Config) -> Batch:
         action, policy_out, music_latent = fwd(params, jax.random.PRNGKey(44 + i))
         rollout.append(
             observation=obs,
-            music=pitch,
+            music=event,
             action=action,
             terminal=jnp.zeros((N,), dtype=bool),
             output=policy_out,
@@ -138,7 +138,7 @@ def test_batch(config: Config) -> Batch:
     return batch
 
 
-def test_onestep_fn() -> None:
+def test_onestep_fn(config: Config) -> None:
     env = create_brax_env(
         env_name="ant",
         episode_length=1000,
@@ -146,10 +146,9 @@ def test_onestep_fn() -> None:
         auto_reset=True,
         batch_size=N,
     )
-    config = Config()
-    init, onestep = make_onestep_fn(env=env, n_pitches=P, config=config)
+    init, onestep = make_onestep_fn(env=env, n_events=E, config=config)
     state = env.reset(jax.random.PRNGKey(44))
-    music = jax.random.randint(jax.random.PRNGKey(45), shape=(4,), minval=0, maxval=P)
+    music = jax.random.randint(jax.random.PRNGKey(45), shape=(4,), minval=0, maxval=E)
     params = init(
         jax.random.PRNGKey(46),
         state,
@@ -174,14 +173,14 @@ def test_onestep_fn() -> None:
 
 
 def test_music_iter() -> None:
-    jsb, _ = load_jsb("/home/yuji/hpc-home/jsb")
-    music_iter = MusicIter(jsb[:8], n_workers=N, seed=0)
+    music, _ = load_emopia("/home/yuji/hpc-home/emopia", 500)
+    music_iter = MusicIter(music[:8], n_workers=N, seed=0)
     first_music, first_ended = next(music_iter)
     chex.assert_shape(first_music, (N,))
     chex.assert_shape(first_ended, (N,))
     for ended in first_ended:
         assert not ended
-    length = [len(music) for music in jsb[:8]]
+    length = [len(music) for music in music[:8]]
     length.sort()
     for _ in range(min(length)):
         _, ended = next(music_iter)
@@ -189,7 +188,7 @@ def test_music_iter() -> None:
 
 
 def test_loss_fn(config: Config) -> None:
-    init, loss_fn = make_loss_fn(A, S, P, config)
+    init, loss_fn = make_loss_fn(A, S, E, config)
     batch = test_batch(config)
     params = init(jax.random.PRNGKey(42), batch, 2.0)
     loss, metrics = loss_fn(params, jax.random.PRNGKey(41), batch, 2.0)
