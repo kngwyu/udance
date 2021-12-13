@@ -38,7 +38,7 @@ class Config:
     """Some hyper parameters required by PPO."""
 
     clip_epsilon: float = 0.2
-    entropy_coef: float = 0.001
+    entropy_coef: float = 0.01
     gamma: float = 0.99
     gae_lambda: float = 0.95
     n_optim_epochs: int = 10
