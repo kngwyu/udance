@@ -865,6 +865,66 @@ def train(
                 viewer_id += 1
 
 
+@chex.dataclass
+class EvalResult:
+    latents: t.List[chex.Array]
+    qps: t.List[brax.QP]
+    music_idx: int
+    is_eval: bool
+
+
+def eval_agent(
+    params: hk.Params,
+    state: hk.State,
+    midi_dir: str,
+    env_name: str = "ant",
+    n_train_midi: int = 128,
+    n_eval_midi: int = 8,
+    min_event_length: int = 500,
+    seed: int = 0,
+) -> t.Tuple[Env, t.List[str, EvalResult]]:
+    env = create_brax_env(
+        env_name=env_name,
+        episode_length=100000,
+        action_repeat=1,
+        auto_reset=True,
+        batch_size=n_eval_midi,
+    )
+    prng_seq = hk.PRNGSequence(seed)
+    events, n_events = load_emopia(midi_dir, min_event_length)
+    config = Config()
+    _, eval_one_step = make_onestep_fn(env=env, n_events=n_events, config=config)
+
+    def eval_one_music(events: chex.Array, idx: int, is_eval: bool) -> EvalResult:
+        eval_actor = Actor(
+            params=actor.params,
+            rnn_state=None,
+            step_fn=eval_one_step,
+        )
+        latents, qps = [], []
+
+        for event in music:
+            state, _, _, latent = eval_actor.step(
+                state=eval_state,
+                music=event.reshape((1,)),
+                prng_key=next(prng_seq),
+                prev_terminal=jnp.zeros((1,)),
+            )
+            latents.append(latent)
+            qps.append(jax.tree_map(lambda x: x.reshape(x.shape[1:]), eval_state.qp))
+
+        return EvalResult(latents=latents, qps=qps, music_idx=idx, is_eval=is_eval)
+
+    results = []
+    for i, music in enumerate(events[:n_eval_midi]):
+        results.append(eval_one_music(music, i, is_eval=False))
+
+    for i, music in enumerate(events[n_train_midi : n_train_midi + n_eval_midi]):
+        results.append(eval_one_music(music, i + n_train_midi, is_eval=True))
+
+    return results
+
+
 if __name__ == "__main__":
     import typer
 
