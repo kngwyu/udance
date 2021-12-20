@@ -54,11 +54,7 @@ def orthogonal(scale: float = 5.0 / 3.0) -> hk.initializers.Orthogonal:
     return hk.initializers.Orthogonal(scale=scale)
 
 
-def mlp(
-    hidden_dims: t.Sequence[int],
-    last_dim: int,
-    last_scale: float = 1.0,
-) -> t.List[hk.Module]:
+def mlp(hidden_dims: t.Sequence[int], last_dim: int) -> t.List[hk.Module]:
     layers = [
         hk.nets.MLP(
             hidden_dims,
@@ -66,7 +62,7 @@ def mlp(
             activation=jax.nn.tanh,
             activate_final=True,
         ),
-        hk.Linear(last_dim, w_init=orthogonal(scale=last_scale)),
+        hk.Linear(last_dim, w_init=orthogonal(scale=1.0)),
     ]
     return hk.Sequential(layers)
 
@@ -184,13 +180,13 @@ class Policy(hk.Module):
 
     def __init__(self, action_dim: int, config: Config) -> None:
         super().__init__(name="policy")
-        self._pi_mean = mlp(config.hidden_dims, action_dim, 0.01)
+        self._pi_mean = mlp(config.hidden_dims, action_dim)
         self._pi_logstd = hk.get_parameter(
             "logstd",
             (1, action_dim),
             init=lambda shape, dtype: jnp.zeros(shape, dtype),
         )
-        self._value = mlp(config.hidden_dims, 1, 1.0)
+        self._value = mlp(config.hidden_dims, 1)
 
     def __call__(self, obs: chex.Array, music_latent: chex.Array) -> PolicyOutput:
         x = jnp.concatenate((obs, music_latent), axis=-1)
@@ -474,7 +470,7 @@ def make_onestep_fn(
             return jnp.where(terminal, new, old)
 
         state = jax.tree_map(reset_if, state, resetted_state)
-        state = env.step(state, jnp.tanh(action))
+        state = env.step(state, action)
         return state, action, policy_out, music_latent.latent, next_rnn_state
 
     return jax.tree_map(jax.jit, hk.transform(step_impl))
